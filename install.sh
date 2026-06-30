@@ -12,8 +12,8 @@ AUDIO_IGNORE="System/Voice Memos/Audio/"
 
 cd "$TOOL_DIR"
 
-echo "==> venv + deps"
-[ -d .venv ] || python3.11 -m venv .venv
+echo "==> venv + deps (--copies => standalone interpreter, grantable for Full Disk Access)"
+[ -d .venv ] || python3.11 -m venv --copies .venv
 .venv/bin/pip install --quiet --upgrade pip
 .venv/bin/pip install --quiet -r requirements.txt
 
@@ -38,5 +38,12 @@ launchctl unload "$PLIST_DST" 2>/dev/null || true
 launchctl load "$PLIST_DST"
 echo "   loaded $PLIST_DST"
 
+echo ""
+echo "==> ⚠️  ONE MANUAL STEP — grant Full Disk Access (the background job can't read the"
+echo "    privacy-protected Voice Memos folder without it):"
+echo "    System Settings → Privacy & Security → Full Disk Access → + → ⌘⇧G →"
+echo "    paste:  $TOOL_DIR/.venv/bin/python3.11   → Open → toggle ON"
+echo "    Then:   launchctl kickstart -k gui/\$(id -u)/com.alexpriest.voice-memo-transcribe"
+echo ""
 echo "==> done. Logs: ~/Library/Logs/voice-memo-transcribe.log"
-echo "    Backfill today on demand: .venv/bin/python process_voice_memos.py --backfill-since $(date +%Y-%m-%d)"
+echo "    Backfill on demand: .venv/bin/python process_voice_memos.py --backfill-since $(date +%Y-%m-%d)"

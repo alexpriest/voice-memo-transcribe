@@ -19,6 +19,7 @@ Modes:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -27,6 +28,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -43,6 +45,8 @@ DB_PATH = RECORDINGS_DIR / "CloudRecordings.db"
 
 TOOL_DIR = Path(__file__).resolve().parent
 LEDGER_PATH = TOOL_DIR / "state" / "processed.json"
+LOCK_PATH = TOOL_DIR / "state" / ".lock"
+SETTLE_SECONDS = 25  # let recording / iCloud writes finish before reading the container
 AUDIO_DEST = VAULT / "System" / "Voice Memos" / "Audio"
 DAILY_DIR = VAULT / "Daily"
 ACTIVITY_DIR = VAULT / "Claude" / "System" / "Activity"
@@ -85,6 +89,19 @@ HIGH_COMPRESSION = 2.4
 
 def log(msg: str) -> None:
     print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
+
+
+def acquire_lock():
+    """Single-instance guard via flock (auto-released on process exit — no stuck locks).
+    Returns the held file object, or None if another instance holds it."""
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        fd.close()
+        return None
+    return fd
 
 
 # ---------------------------------------------------------------------------- #
@@ -320,17 +337,27 @@ def enrich(memo: dict, transcription: dict, entities: str, notify_enabled: bool)
         "--max-budget-usd", "0.50",
         prompt,
     ]
-    try:
-        proc = subprocess.run(
-            cmd, cwd=str(VAULT), capture_output=True, text=True, timeout=300
-        )
-    except (subprocess.TimeoutExpired, OSError) as e:
-        log(f"  enrich failed: {e}")
-        return None
-    if proc.returncode != 0:
-        log(f"  enrich exit {proc.returncode}: {proc.stderr[:300]}")
-        return None
-    return parse_json(proc.stdout)
+    # Retry: claude -p can fail transiently (flaky API moment). One hiccup must not
+    # demote a memo to a raw transcript.
+    for attempt in range(1, 4):
+        try:
+            proc = subprocess.run(
+                cmd, cwd=str(VAULT), capture_output=True, text=True, timeout=300
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log(f"  enrich attempt {attempt} error: {e}")
+        else:
+            if proc.returncode == 0:
+                parsed = parse_json(proc.stdout)
+                if parsed:
+                    return parsed
+                log(f"  enrich attempt {attempt}: unparseable stdout: {proc.stdout[:200]!r}")
+            else:
+                log(f"  enrich attempt {attempt}: exit {proc.returncode} "
+                    f"stdout={proc.stdout[:200]!r} stderr={proc.stderr[:200]!r}")
+        if attempt < 3:
+            time.sleep(4)
+    return None
 
 
 def parse_json(raw: str) -> dict | None:
@@ -523,7 +550,16 @@ def main() -> int:
     ap.add_argument("--no-notify", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--limit", type=int)
+    ap.add_argument("--daemon", action="store_true",
+                    help="launchd mode: single-instance lock + settle delay")
     args = ap.parse_args()
+
+    if args.daemon:
+        lock = acquire_lock()
+        if lock is None:
+            log("another run in progress — exiting")
+            return 0
+        time.sleep(SETTLE_SECONDS)
 
     ledger = load_ledger()
     memos = query_memos()

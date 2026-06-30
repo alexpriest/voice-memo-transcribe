@@ -6,8 +6,9 @@
     <string>com.alexpriest.voice-memo-transcribe</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/bash</string>
-        <string>/Users/alex/Code/tools/voice-memo-transcribe/run.sh</string>
+        <string>/Users/alex/Code/tools/voice-memo-transcribe/.venv/bin/python3.11</string>
+        <string>/Users/alex/Code/tools/voice-memo-transcribe/process_voice_memos.py</string>
+        <string>--daemon</string>
     </array>
     <key>WorkingDirectory</key>
     <string>/Users/alex/Obsidian/alexpriest</string>
