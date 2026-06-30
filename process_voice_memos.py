@@ -298,6 +298,8 @@ naming the memo title, its time, and the specific flags.
 NOTIFY_ENABLED: {notify_enabled}
 {notify_instruction}
 
+Never use emojis anywhere — not in the title, the transcript, the flags, or the SMS.
+
 OUTPUT — a single minified JSON object and NOTHING else:
 {{"title": "<short clever title>", \
 "cleaned_markdown": "<the cleaned body with wikilinks and [unclear] markers>", \
@@ -419,7 +421,7 @@ def daily_note_stub(dt: datetime) -> str:
 def build_callout(memo: dict, audio_filename: str, body: str,
                   uncertainties: list[str], title: str) -> str:
     header = (
-        f"> [!note]- 🎙️ {title} — "
+        f"> [!note]- {title} — "
         f"{memo['recorded']:%-I:%M %p} · {fmt_duration(memo['duration'])}"
     )
     lines = [header, f"> ![[{audio_filename}]]", ">"]
@@ -427,7 +429,7 @@ def build_callout(memo: dict, audio_filename: str, body: str,
         lines.append(f"> {ln}" if ln.strip() else ">")
     if uncertainties:
         lines.append(">")
-        lines.append(f"> *⚠️ {'; '.join(uncertainties)}*")
+        lines.append(f"> *Flagged: {'; '.join(uncertainties)}*")
     return "\n".join(lines)
 
 
