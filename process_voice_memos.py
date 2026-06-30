@@ -58,6 +58,25 @@ MIN_MTIME_AGE_S = 30  # file must have been still for this long (finished syncin
 
 PROJECT_NOUNS = ["Cartographer", "Duckbill", "Firesale", "Anthimeros", "Syntensor", "Halcie"]
 
+# Alex's most-mentioned people. Linked CONFIDENTLY (no "?", no flag/notify) even when
+# whisper garbles the name into a close phonetic variant. Toddler names especially get mangled.
+# "refs" lists how Alex says them in speech + likely mis-hearings.
+INNER_CIRCLE = [
+    {"note": "Miranda Gale", "refs": ["Miranda", "Mir"], "who": "Alex's wife"},
+    {"note": "Halcyon Priest",
+     "refs": ["Halcie", "Halcyon", "Hossie", "Halcey", "Hosie", "Halsey", "Howie"],
+     "who": "Alex's 2yo daughter (NOT the Halcie hardware project — context decides)"},
+    {"note": "Zephyr Priest", "refs": ["Zephyr", "Zeph", "Zef"], "who": "Alex's 4yo son"},
+    {"note": "Jack Villani", "refs": ["Jack"], "who": "friend"},
+    {"note": "AJ Adams", "refs": ["AJ", "A.J."], "who": "best friend, godparent to the kids"},
+    {"note": "Ashley Adams", "refs": ["Ash", "Ashley"],
+     "who": "AJ's wife, family friend (default for 'Ash' unless context clearly means a work 'Ash')"},
+]
+
+# Write the generated title back into the Voice Memos app DB (local Mac only).
+# Off by default — Apple's store is CloudKit-backed and raw writes don't reliably sync.
+RENAME_IN_APP = False
+
 # Whisper segment confidence thresholds -> "shaky" span
 LOW_AVG_LOGPROB = -1.0
 HIGH_NO_SPEECH = 0.6
@@ -192,9 +211,20 @@ def build_entities() -> str:
                 lines.append(f"- {md.stem}")
             count += 1
     people_block = "\n".join(lines) if lines else "(none found)"
+
+    inner = "\n".join(
+        f"- [[{p['note']}]] — say/mishear: {', '.join(p['refs'])} ({p['who']})"
+        for p in INNER_CIRCLE
+    )
     return (
-        "KNOWN PEOPLE (link with the exact note name on the left; the parenthetical "
-        "first-names/aliases are how Alex usually refers to them in speech):\n"
+        "INNER CIRCLE — Alex's most-mentioned people. Resolve these CONFIDENTLY: link with the "
+        "exact note name, NO trailing '?', and do NOT flag or notify — even when the speech model "
+        "garbled the name into a close phonetic variant (e.g. 'Hossie' or 'Halcey' => [[Halcyon "
+        "Priest]]). Use context (a memo about home/kids/family => the family members):\n"
+        f"{inner}\n\n"
+        "OTHER KNOWN PEOPLE (link the exact note name when clearly referenced; parenthetical = "
+        "how Alex refers to them). For these, if a reference is a genuine guess, link it but add a "
+        "trailing '?' and flag it:\n"
         f"{people_block}\n\n"
         f"KNOWN PROJECTS (link these exact names): {', '.join(PROJECT_NOUNS)}"
     )
@@ -231,23 +261,29 @@ scrutinize those words; they are the likeliest errors):
 {entities}
 
 YOUR JOB:
-1. Lightly clean the transcript: add punctuation/capitalization, fix obvious mis-hearings, \
+1. Write a short, specific, lightly clever TITLE (4-8 words) capturing the memo's main content. \
+No date, no quotes, no trailing punctuation. Sentence case. E.g. "Bike-ride debrief and a messy, \
+productive morning".
+2. Lightly clean the transcript: add punctuation/capitalization, fix obvious mis-hearings, \
 remove filler ("um", "uh", false starts), break into paragraphs. NEVER change meaning, add \
 content, or summarize. Keep Alex's words.
-2. Wrap any person or project from the KNOWN lists in [[Exact Note Name]] when clearly referenced. \
-Use ONLY names from those lists — never invent a link. If a reference is ambiguous or you are \
-guessing, still link it but append a literal question mark after the closing brackets: [[Name]]?
-3. Mark any genuinely garbled/unintelligible span as [unclear: "your best guess"].
-4. Decide should_notify: true ONLY if there is a meaningful uncertainty worth Alex's eyes \
-(a garbled word that changes meaning, or a guessed link). Trivially clean memos => false.
-5. If notifying, write notify_text: a PLAIN-TEXT SMS (no markdown, no asterisks, under 320 chars) \
-naming the memo, its time, and the specific flags.
+3. Wrap any person or project from the lists above in [[Exact Note Name]] when clearly referenced. \
+Use ONLY names from those lists — never invent a link. Follow the INNER CIRCLE rule: resolve those \
+people confidently (no "?", no flag) including obvious phonetic manglings. For OTHER people, if a \
+reference is a genuine guess, link it with a trailing "?" and flag it.
+4. Mark any genuinely garbled/unintelligible span as [unclear: "your best guess"].
+5. Decide should_notify: true ONLY if there is a meaningful uncertainty worth Alex's eyes \
+(a garbled word that changes meaning, or a guessed link to a NON-inner-circle person). \
+Inner-circle phonetic resolutions and trivially clean memos => false.
+6. If notifying, write notify_text: a PLAIN-TEXT SMS (no markdown, no asterisks, under 320 chars) \
+naming the memo title, its time, and the specific flags.
 
 NOTIFY_ENABLED: {notify_enabled}
 {notify_instruction}
 
 OUTPUT — a single minified JSON object and NOTHING else:
-{{"cleaned_markdown": "<the cleaned body with wikilinks and [unclear] markers>", \
+{{"title": "<short clever title>", \
+"cleaned_markdown": "<the cleaned body with wikilinks and [unclear] markers>", \
 "uncertainties": ["<short human-readable flag>", ...], \
 "should_notify": <true|false>, "notify_text": "<sms text or empty string>"}}
 """
@@ -331,7 +367,9 @@ def fmt_duration(seconds: float) -> str:
 def slugify(text: str) -> str:
     s = re.sub(r"[^\w\s-]", "", text).strip()
     s = re.sub(r"\s+", " ", s)
-    return s[:50] or "voice-memo"
+    if len(s) > 50:
+        s = s[:50].rsplit(" ", 1)[0]  # trim to a word boundary, not mid-word
+    return s or "voice-memo"
 
 
 def daily_note_path(dt: datetime) -> Path:
@@ -351,31 +389,42 @@ def daily_note_stub(dt: datetime) -> str:
     )
 
 
-def build_callout(memo: dict, audio_filename: str, body: str, uncertainties: list[str]) -> str:
+def build_callout(memo: dict, audio_filename: str, body: str,
+                  uncertainties: list[str], title: str) -> str:
     header = (
-        f"> [!note]- 🎙️ {memo['title']} — "
+        f"> [!note]- 🎙️ {title} — "
         f"{memo['recorded']:%-I:%M %p} · {fmt_duration(memo['duration'])}"
     )
-    lines = [header, f"> ![[{audio_filename}]]", ">"]
+    lines = [f"<!-- vm:{memo['uid']} -->", header, f"> ![[{audio_filename}]]", ">"]
     for ln in body.strip().splitlines():
         lines.append(f"> {ln}" if ln.strip() else ">")
     if uncertainties:
         lines.append(">")
         lines.append(f"> *⚠️ {'; '.join(uncertainties)}*")
+    lines.append(f"<!-- /vm:{memo['uid']} -->")
     return "\n".join(lines)
 
 
 def insert_callout(note_path: Path, callout: str) -> None:
-    """Ensure a '# Voice Memos' section exists and add the callout at the end of it."""
+    """Ensure a '# Voice Memos' section exists and add the callout at the end of it.
+    If a block for the same memo uid already exists, replace it in place (idempotent re-runs)."""
     if note_path.exists():
         text = note_path.read_text()
     else:
         note_path.parent.mkdir(parents=True, exist_ok=True)
-        text = None
-    if text is None:
-        # new note
         dt = datetime.strptime(note_path.stem, "%Y-%m-%d")
         text = daily_note_stub(dt)
+
+    uid_match = re.search(r"<!-- vm:(\S+) -->", callout)
+    if uid_match:
+        uid = re.escape(uid_match.group(1))
+        existing = re.compile(
+            r"\n*<!-- vm:" + uid + r" -->.*?<!-- /vm:" + uid + r" -->\n*",
+            re.DOTALL,
+        )
+        if existing.search(text):
+            note_path.write_text(existing.sub("\n\n" + callout + "\n", text))
+            return
 
     block = "\n" + callout + "\n"
     if "# Voice Memos" not in text:
@@ -397,17 +446,36 @@ def insert_callout(note_path: Path, callout: str) -> None:
     note_path.write_text(text)
 
 
-def copy_audio(memo: dict) -> str:
+def copy_audio(memo: dict, title: str) -> str:
     AUDIO_DEST.mkdir(parents=True, exist_ok=True)
     shortid = memo["uid"].split("-")[0][:8]
-    filename = f"{memo['recorded']:%Y-%m-%d %H%M} {slugify(memo['title'])} {shortid}.m4a"
+    filename = f"{memo['recorded']:%Y-%m-%d %H%M} {slugify(title)} {shortid}.m4a"
     dest = AUDIO_DEST / filename
     if not dest.exists():
         shutil.copy2(memo["audio"], dest)
     return filename
 
 
-def append_activity(memo: dict, flags: list[str]) -> None:
+def rename_in_app(memo: dict, app_title: str) -> bool:
+    """Best-effort: write the title into the Voice Memos local DB so the app shows it.
+    Apple's store is CloudKit-backed — this updates the LOCAL Mac copy; it may not sync to
+    iPhone and can be reverted by iCloud. Gated behind RENAME_IN_APP."""
+    try:
+        con = sqlite3.connect(str(DB_PATH), timeout=5)
+        con.execute(
+            "UPDATE ZCLOUDRECORDING SET ZENCRYPTEDTITLE=?, ZCUSTOMLABELFORSORTING=? "
+            "WHERE ZUNIQUEID=?",
+            (app_title, app_title, memo["uid"]),
+        )
+        con.commit()
+        con.close()
+        return True
+    except sqlite3.Error as e:
+        log(f"  app rename failed: {e}")
+        return False
+
+
+def append_activity(memo: dict, flags: list[str], title: str) -> None:
     now = datetime.now()
     path = ACTIVITY_DIR / f"{now:%Y-%m-%d} Kit Activity Log.md"
     if not path.exists():
@@ -418,7 +486,7 @@ def append_activity(memo: dict, flags: list[str]) -> None:
         )
     flag_str = f"{len(flags)} flag(s)" if flags else "clean"
     line = (
-        f"- {now:%H:%M} [voice-memos] Transcribed \"{memo['title']}\" "
+        f"- {now:%H:%M} [voice-memos] Transcribed \"{title}\" "
         f"({fmt_duration(memo['duration'])}) → {memo['recorded']:%-m/%-d} daily note. {flag_str}\n"
     )
     with path.open("a") as f:
@@ -499,12 +567,14 @@ def main() -> int:
         uncertainties: list[str] = []
         notify_text = ""
         should_notify = False
+        clever_title = m["title"]
         if args.raw:
             body = tr["text"]
         else:
             enriched = enrich(m, tr, entities, notify_enabled)
             if enriched:
                 body = enriched.get("cleaned_markdown") or tr["text"]
+                clever_title = (enriched.get("title") or "").strip() or m["title"]
                 uncertainties = enriched.get("uncertainties") or []
                 should_notify = bool(enriched.get("should_notify"))
                 notify_text = enriched.get("notify_text") or ""
@@ -517,21 +587,27 @@ def main() -> int:
                     f"auto-cleanup failed; raw text is in the {m['recorded']:%-m/%-d} daily note."
                 )
 
+        app_title = f"{m['recorded']:%Y-%m-%d} — {clever_title}"
+
         if args.dry_run:
+            log(f"  [dry-run] title: {clever_title!r}  (app: {app_title!r})")
             log("  [dry-run] would write callout:")
-            print(build_callout(m, "AUDIO.m4a", body, uncertainties))
+            print(build_callout(m, "AUDIO.m4a", body, uncertainties, clever_title))
             log(f"  [dry-run] should_notify={should_notify} notify_text={notify_text!r}")
             continue
 
-        audio_filename = copy_audio(m)
+        audio_filename = copy_audio(m, clever_title)
         note_path = daily_note_path(m["recorded"])
-        callout = build_callout(m, audio_filename, body, uncertainties)
+        callout = build_callout(m, audio_filename, body, uncertainties, clever_title)
         insert_callout(note_path, callout)
-        append_activity(m, uncertainties)
+        append_activity(m, uncertainties, clever_title)
+        renamed = rename_in_app(m, app_title) if RENAME_IN_APP else False
         ledger[m["uid"]] = {
             "status": "done",
             "note": str(note_path.relative_to(VAULT)),
-            "title": m["title"],
+            "orig_title": m["title"],
+            "title": clever_title,
+            "app_renamed": renamed,
             "flags": uncertainties,
             "processed_at": datetime.now().isoformat(timespec="seconds"),
         }
