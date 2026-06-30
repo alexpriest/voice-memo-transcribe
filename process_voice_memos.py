@@ -422,13 +422,13 @@ def build_callout(memo: dict, audio_filename: str, body: str,
         f"> [!note]- 🎙️ {title} — "
         f"{memo['recorded']:%-I:%M %p} · {fmt_duration(memo['duration'])}"
     )
-    lines = [f"<!-- vm:{memo['uid']} -->", header, f"> ![[{audio_filename}]]", ">"]
+    lines = [f"%%vm:{memo['uid']}%%", header, f"> ![[{audio_filename}]]", ">"]
     for ln in body.strip().splitlines():
         lines.append(f"> {ln}" if ln.strip() else ">")
     if uncertainties:
         lines.append(">")
         lines.append(f"> *⚠️ {'; '.join(uncertainties)}*")
-    lines.append(f"<!-- /vm:{memo['uid']} -->")
+    lines.append(f"%%/vm:{memo['uid']}%%")
     return "\n".join(lines)
 
 
@@ -442,11 +442,11 @@ def insert_callout(note_path: Path, callout: str) -> None:
         dt = datetime.strptime(note_path.stem, "%Y-%m-%d")
         text = daily_note_stub(dt)
 
-    uid_match = re.search(r"<!-- vm:(\S+) -->", callout)
+    uid_match = re.search(r"%%vm:(\S+?)%%", callout)
     if uid_match:
         uid = re.escape(uid_match.group(1))
         existing = re.compile(
-            r"\n*<!-- vm:" + uid + r" -->.*?<!-- /vm:" + uid + r" -->\n*",
+            r"\n*%%vm:" + uid + r"%%.*?%%/vm:" + uid + r"%%\n*",
             re.DOTALL,
         )
         if existing.search(text):
