@@ -422,19 +422,20 @@ def build_callout(memo: dict, audio_filename: str, body: str,
         f"> [!note]- 🎙️ {title} — "
         f"{memo['recorded']:%-I:%M %p} · {fmt_duration(memo['duration'])}"
     )
-    lines = [f"%%vm:{memo['uid']}%%", header, f"> ![[{audio_filename}]]", ">"]
+    lines = [header, f"> ![[{audio_filename}]]", ">"]
     for ln in body.strip().splitlines():
         lines.append(f"> {ln}" if ln.strip() else ">")
     if uncertainties:
         lines.append(">")
         lines.append(f"> *⚠️ {'; '.join(uncertainties)}*")
-    lines.append(f"%%/vm:{memo['uid']}%%")
     return "\n".join(lines)
 
 
-def insert_callout(note_path: Path, callout: str) -> None:
+def insert_callout(note_path: Path, callout: str, uid: str) -> None:
     """Ensure a '# Voice Memos' section exists and add the callout at the end of it.
-    If a block for the same memo uid already exists, replace it in place (idempotent re-runs)."""
+    Idempotent: if a callout for this memo already exists (identified by the memo's stable
+    short-id embedded in the audio filename), replace that callout block in place — no
+    visible marker needed."""
     if note_path.exists():
         text = note_path.read_text()
     else:
@@ -442,16 +443,20 @@ def insert_callout(note_path: Path, callout: str) -> None:
         dt = datetime.strptime(note_path.stem, "%Y-%m-%d")
         text = daily_note_stub(dt)
 
-    uid_match = re.search(r"%%vm:(\S+?)%%", callout)
-    if uid_match:
-        uid = re.escape(uid_match.group(1))
-        existing = re.compile(
-            r"\n*%%vm:" + uid + r"%%.*?%%/vm:" + uid + r"%%\n*",
-            re.DOTALL,
-        )
-        if existing.search(text):
-            note_path.write_text(existing.sub("\n\n" + callout + "\n", text))
-            return
+    shortid = uid.split("-")[0][:8]
+    lines = text.split("\n")
+    embed_idx = next((i for i, ln in enumerate(lines) if f"{shortid}.m4a]]" in ln), None)
+    if embed_idx is not None:
+        # a callout is a contiguous run of lines starting with '>'; expand to its bounds
+        start = embed_idx
+        while start > 0 and lines[start - 1].startswith(">"):
+            start -= 1
+        end = embed_idx
+        while end + 1 < len(lines) and lines[end + 1].startswith(">"):
+            end += 1
+        new_lines = lines[:start] + callout.split("\n") + lines[end + 1:]
+        note_path.write_text("\n".join(new_lines))
+        return
 
     block = "\n" + callout + "\n"
     if "# Voice Memos" not in text:
@@ -478,6 +483,10 @@ def copy_audio(memo: dict, title: str) -> str:
     shortid = memo["uid"].split("-")[0][:8]
     filename = f"{memo['recorded']:%Y-%m-%d %H%M} {slugify(title)} {shortid}.m4a"
     dest = AUDIO_DEST / filename
+    # drop stale copies for this memo (title — and thus filename — can change on reprocess)
+    for old in AUDIO_DEST.glob(f"*{shortid}.m4a"):
+        if old.name != filename:
+            old.unlink()
     if not dest.exists():
         shutil.copy2(memo["audio"], dest)
     return filename
@@ -635,7 +644,7 @@ def main() -> int:
         audio_filename = copy_audio(m, clever_title)
         note_path = daily_note_path(m["recorded"])
         callout = build_callout(m, audio_filename, body, uncertainties, clever_title)
-        insert_callout(note_path, callout)
+        insert_callout(note_path, callout, m["uid"])
         append_activity(m, uncertainties, clever_title)
         renamed = rename_in_app(m, app_title) if RENAME_IN_APP else False
         ledger[m["uid"]] = {
