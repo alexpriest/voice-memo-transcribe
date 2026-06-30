@@ -1,0 +1,186 @@
+# Voice Memo → Obsidian — Design Spec
+
+**Date:** 2026-06-29
+**Status:** Approved design, pre-implementation
+**Owner:** Kit (Chief of Staff) for Alex
+
+## Goal
+
+Any new Apple Voice Memo is automatically detected, transcribed, and written into the
+correct Obsidian daily note under a collapsible toggle — with the audio embedded for inline
+playback, light cleanup, and `[[wikilinks]]` to known people/projects. Kit texts Alex only
+when a transcription word is genuinely garbled or a wikilink is a guess.
+
+## Confirmed decisions
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| Transcription engine | Local **mlx-whisper** (`large-v3-turbo`) | Private, offline, free; gives per-segment confidence scores that drive the "text me when unsure" feature |
+| Processing depth | **Full Claude-in-the-loop** | Cleanup + wikilinks + uncertainty judgment require an LLM; matches Alex's existing agent architecture |
+| Trigger | **Event-driven** (launchd `WatchPaths`) + once/day catch-up | Near-instant when the Mac is awake; catch-up covers asleep periods |
+| Audio storage | **Gitignored, Mac-Mini-local** | Plays inline in Obsidian, no repo bloat, never hits the website-sync trigger; transcript is the durable cross-machine record; original survives in iCloud |
+| Host | **Mac Mini only** | Avoid double-processing; ledger is machine-local |
+
+## Non-goals (v1 / YAGNI)
+
+- Phone-side real-time transcription (the big build — explicitly deferred)
+- Speaker diarization
+- Re-syncing a note if a memo is renamed/edited in Voice Memos after the fact
+- Committing audio to git / cross-machine audio playback
+- Backfilling years of history (one-time recent backfill available on demand only)
+
+## Architecture
+
+Four stages, on the Mac Mini:
+
+```
+launchd  →  run.sh  →  process_voice_memos.py
+ (WatchPaths Recordings/ + daily catch-up)
+        │
+        ├─ 1. DETECT      read CloudRecordings.db → new finalized memos
+        ├─ 2. TRANSCRIBE  mlx-whisper → text + per-segment confidence
+        ├─ 3. ENRICH      claude -p (pure-ish): clean, wikilink, judge, notify
+        └─ 4. PLACE       Python: copy audio, find/create daily note, insert toggle,
+                          update ledger, log
+```
+
+**Division of labor:** Python owns everything deterministic (detection, transcription,
+all file I/O, idempotency). Claude owns only linguistic judgment (cleanup, wikilinks,
+uncertainty) and sends the notification text via the proven `mcp__kit-tools__send_message`
+path. The LLM surface is small and well-defined.
+
+## Stage detail
+
+### 1. Detect — `CloudRecordings.db`
+
+- Source DB: `~/Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings/CloudRecordings.db`
+- The DB is open by Voice Memos.app — **copy db + `-wal` + `-shm` to a temp dir, then query** (avoids lock/WAL staleness). Read-only.
+- Query `ZCLOUDRECORDING`:
+  ```sql
+  SELECT Z_PK, ZUNIQUEID, ZENCRYPTEDTITLE, ZCUSTOMLABEL, ZDATE, ZDURATION, ZPATH
+  FROM ZCLOUDRECORDING
+  WHERE ZPATH LIKE '%.m4a'
+    AND ZDURATION >= 3.0
+  ORDER BY ZDATE ASC;
+  ```
+- Record time (local): `datetime(ZDATE + 978307200, 'unixepoch', 'localtime')` (Core Data epoch).
+- Title: prefer `ZENCRYPTEDTITLE` (verified plaintext, holds the human name e.g. "New Recording 10", "Deer Ridge Cir 3"); fall back to `ZCUSTOMLABEL`, else "Voice Memo".
+- Full audio path: `<group container>/Recordings/<ZPATH>`.
+- **Filters:** `.m4a` only (skip `.qta` in-progress scraps), duration ≥ 3s (skip accidental taps),
+  file exists + size > 0 + mtime settled (>30s old), `ZUNIQUEID` not already in the ledger.
+- History is ignored: only memos newer than the install watermark are processed (ledger seeded
+  with all existing IDs at install, OR a watermark timestamp captured at install).
+
+### 2. Transcribe — mlx-whisper
+
+- `mlx_whisper.transcribe(path, path_or_hf_repo="mlx-community/whisper-large-v3-turbo")`
+- Returns `segments[]`, each with `text`, `avg_logprob`, `no_speech_prob`, `compression_ratio`.
+- A segment is flagged **low-confidence** if `avg_logprob < -1.0` OR `no_speech_prob > 0.6`
+  OR `compression_ratio > 2.4`. These flags are passed to Claude so it knows which spans are shaky.
+
+### 3. Enrich — `claude -p`
+
+Invocation mirrors `~/Code/tools/daily-question/run.sh`:
+`claude -p --permission-mode bypassPermissions --model claude-sonnet-4-6 --max-budget-usd 0.50`,
+run from the vault dir.
+
+**Input to the prompt:**
+- Raw transcript with segment boundaries + low-confidence flags
+- The linkable-entity list: People/ note basenames + frontmatter `aliases`, plus project
+  nouns (Cartographer, Duckbill, Firesale, Anthimeros, Syntensor, Halcie) and Projects/ folder names
+- Memo metadata (title, time, duration)
+
+**Claude's instructions:**
+- Lightly clean: punctuation, capitalization, remove filler ("um", false starts), paragraph breaks.
+  **Never** change meaning or invent content.
+- Wrap recognized entities in `[[Exact Note Name]]` — **only** names from the supplied list (no red links).
+- Mark genuinely-garbled spans `[unclear: "best guess"]`; suffix a guessed link with `?`.
+- Decide `should_notify` (true only when there's a meaningful uncertainty worth a human glance).
+- If notifying, send a **plain-text** iMessage to **+12702871307** via `mcp__kit-tools__send_message`
+  (no markdown), naming the memo + time + the specific flags.
+
+**Output:** a single minified JSON object to stdout:
+```json
+{"cleaned_markdown":"...","uncertainties":["..."],"notified":true,"notify_text":"..."}
+```
+Python extracts the first `{...}` block and parses it.
+
+**Fallback:** if `claude -p` errors or returns no parseable JSON, Python writes the **raw**
+whisper transcript under the toggle with a "(enrichment failed — raw transcript)" marker and
+texts a single heads-up. A memo is never lost.
+
+### 4. Place — Python (deterministic)
+
+- **Target note:** `Daily/<YYYY>/<MM-Month>/<YYYY-MM-DD>.md` from the memo's record date
+  (month folder e.g. `06-June`). Create year/month dirs as needed.
+- **Missing note:** create with the static daily-note structure (no Templater execution):
+  frontmatter (`tags: [periodic/daily]`, `title`, `daily-date`, `cssclasses: [hide-properties]`),
+  `# Morning Pages` + placeholder, `---`, `# Jots`.
+- **Insert:** ensure a `# Voice Memos` section exists (append at end of note if absent).
+  Add the memo as a **collapsed callout**, in chronological order within the section:
+  ```markdown
+  > [!note]- 🎙️ {title} — {h:mm A} · {Xm Ys}
+  > ![[{YYYY-MM-DD HHMM} voice-memo.m4a]]
+  >
+  > {cleaned_markdown with wikilinks}
+  >
+  > *⚠️ {uncertainties joined}*   ← only if any
+  ```
+  The trailing `-` on `[!note]-` = collapsed by default (the requested toggle).
+- **Audio:** copy original → `System/Voice Memos/Audio/<YYYY-MM-DD HHMM> {slug}.m4a`; embed by filename.
+  This folder is added to the vault `.gitignore`.
+- **Ledger:** `~/Code/tools/voice-memo-transcribe/state/processed.json`, keyed by `ZUNIQUEID` →
+  `{processed_at, note_path, status, flags}`. Idempotent; re-runs skip done memos.
+- **Activity log:** append one line to `Claude/System/Activity/<YYYY-MM-DD> Kit Activity Log.md`
+  (create from template if missing) under source tag `[voice-memos]`:
+  `- HH:MM [voice-memos] Transcribed "{title}" ({dur}) → {date} daily note. {clean | N flags}`.
+
+## Trigger — launchd
+
+`~/Library/LaunchAgents/com.alexpriest.voice-memo-transcribe.plist`:
+- `WatchPaths` → the Recordings dir (fires on change).
+- `StartCalendarInterval` → daily catch-up (e.g. 06:30) for memos that synced while asleep.
+- `ProgramArguments` → `/bin/bash <tool>/run.sh`; `WorkingDirectory` = vault;
+  `EnvironmentVariables` PATH (incl. `~/.local/bin`, `/opt/homebrew/bin`) + HOME.
+- Logs → `~/Library/Logs/voice-memo-transcribe.log`. `RunAtLoad` false.
+- **Concurrency guard:** `run.sh` takes a lockfile (single instance), sleeps ~25s to let
+  iCloud/recording writes settle, then processes only finalized + unprocessed memos. Cheap no-op
+  when nothing is new (WatchPaths can fire many times mid-recording).
+
+## Files
+
+```
+~/Code/tools/voice-memo-transcribe/
+  SPEC.md                                  # this doc
+  README.md                                # what it is, install, ops, troubleshooting
+  run.sh                                   # launchd entrypoint (bash + lockfile + settle)
+  process_voice_memos.py                   # orchestrator (detect, transcribe, enrich, place)
+  requirements.txt                         # mlx-whisper
+  install.sh                               # venv, deps, model pre-download, plist load, gitignore
+  com.alexpriest.voice-memo-transcribe.plist   # plist template (paths substituted on install)
+  .gitignore                               # .venv/, state/, *.log
+  state/processed.json                     # ledger (gitignored)
+```
+
+Vault side: `System/Voice Memos/Audio/` (gitignored) holds the audio copies.
+
+## Failure handling
+
+| Failure | Behavior |
+|---------|----------|
+| DB locked | Copy-with-retry; if still failing, log + clean exit |
+| whisper error on a file | Log, mark ledger `status:error`, skip that memo (don't block others), retry next run |
+| `claude -p` error / no JSON | Write raw transcript under the toggle + "(enrichment failed)" marker + one heads-up text |
+| Overlapping launchd fires | Lockfile → single instance; everything idempotent |
+| Mac asleep at memo sync | Daily catch-up run picks it up |
+
+## Privacy
+
+Audio never leaves the device (local whisper, gitignored). Transcript text is committed to the
+**private** vault git repo. No third-party service touches the recordings.
+
+## One-time backfill
+
+`process_voice_memos.py --backfill-since YYYY-MM-DD` processes recent memos on demand
+(used once at go-live to transcribe today's so Alex sees it working). Default behavior never
+touches history.
