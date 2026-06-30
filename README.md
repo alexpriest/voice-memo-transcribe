@@ -11,7 +11,9 @@ See [SPEC.md](./SPEC.md) for the full design. Runs on the Mac Mini via launchd.
 
 ## Status
 
-Design approved 2026-06-29. Implementation pending.
+Live since 2026-06-29 (Mac Mini). launchd agent `com.alexpriest.voice-memo-transcribe`
+watches the Recordings dir + a 06:30 daily catch-up. History seeded/ignored; only new
+memos are processed.
 
 ## Install (after build)
 

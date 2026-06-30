@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.alexpriest.voice-memo-transcribe</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/alex/Code/tools/voice-memo-transcribe/run.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/alex/Obsidian/alexpriest</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/alex/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/alex</string>
+    </dict>
+    <key>WatchPaths</key>
+    <array>
+        <string>/Users/alex/Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>6</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/Users/alex/Library/Logs/voice-memo-transcribe.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/alex/Library/Logs/voice-memo-transcribe.log</string>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
