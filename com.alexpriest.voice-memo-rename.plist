@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.alexpriest.voice-memo-rename</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/alex/Code/tools/voice-memo-transcribe/.venv/bin/python3.11</string>
+        <string>/Users/alex/Code/tools/voice-memo-transcribe/process_voice_memos.py</string>
+        <string>--rename-queue</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/alex/Obsidian/alexpriest</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/alex/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/alex</string>
+    </dict>
+    <key>StartInterval</key>
+    <integer>180</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/alex/Library/Logs/voice-memo-rename.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/alex/Library/Logs/voice-memo-rename.log</string>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

@@ -5,8 +5,7 @@ set -euo pipefail
 
 TOOL_DIR="/Users/alex/Code/tools/voice-memo-transcribe"
 VAULT="/Users/alex/Obsidian/alexpriest"
-PLIST_SRC="$TOOL_DIR/com.alexpriest.voice-memo-transcribe.plist"
-PLIST_DST="/Users/alex/Library/LaunchAgents/com.alexpriest.voice-memo-transcribe.plist"
+LA="/Users/alex/Library/LaunchAgents"
 GITIGNORE="$VAULT/.gitignore"
 AUDIO_IGNORE="System/Voice Memos/Audio/"
 
@@ -32,18 +31,24 @@ fi
 echo "==> seeding ledger (ignore all existing memos)"
 .venv/bin/python process_voice_memos.py --seed-ledger
 
-echo "==> launchd agent"
-cp "$PLIST_SRC" "$PLIST_DST"
-launchctl unload "$PLIST_DST" 2>/dev/null || true
-launchctl load "$PLIST_DST"
-echo "   loaded $PLIST_DST"
+echo "==> launchd agents (transcribe: event-driven; rename: every 180s, idle-gated)"
+for name in voice-memo-transcribe voice-memo-rename; do
+    cp "$TOOL_DIR/com.alexpriest.$name.plist" "$LA/com.alexpriest.$name.plist"
+    launchctl unload "$LA/com.alexpriest.$name.plist" 2>/dev/null || true
+    launchctl load "$LA/com.alexpriest.$name.plist"
+    echo "   loaded com.alexpriest.$name"
+done
 
+PY="$TOOL_DIR/.venv/bin/python3.11"
 echo ""
-echo "==> ⚠️  ONE MANUAL STEP — grant Full Disk Access (the background job can't read the"
-echo "    privacy-protected Voice Memos folder without it):"
-echo "    System Settings → Privacy & Security → Full Disk Access → + → ⌘⇧G →"
-echo "    paste:  $TOOL_DIR/.venv/bin/python3.11   → Open → toggle ON"
-echo "    Then:   launchctl kickstart -k gui/\$(id -u)/com.alexpriest.voice-memo-transcribe"
+echo "==> ⚠️  TWO MANUAL PERMISSION GRANTS (macOS won't let a script grant these)."
+echo "    Both target the same binary:  $PY"
+echo "    In System Settings → Privacy & Security:"
+echo "      1. Full Disk Access  → + → ⌘⇧G → paste the path → Open → toggle ON"
+echo "         (lets the background job READ the protected Voice Memos folder)"
+echo "      2. Accessibility     → + → ⌘⇧G → paste the path → Open → toggle ON"
+echo "         (lets the rename runner DRIVE the Voice Memos rename UI)"
+echo "    Then: launchctl kickstart -k gui/\$(id -u)/com.alexpriest.voice-memo-transcribe"
 echo ""
-echo "==> done. Logs: ~/Library/Logs/voice-memo-transcribe.log"
-echo "    Backfill on demand: .venv/bin/python process_voice_memos.py --backfill-since $(date +%Y-%m-%d)"
+echo "==> done. Logs: ~/Library/Logs/voice-memo-transcribe.log + voice-memo-rename.log"
+echo "    Rename backlog now (bypass idle gate): $PY process_voice_memos.py --rename-queue --force"

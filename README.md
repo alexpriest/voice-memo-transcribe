@@ -7,21 +7,37 @@ wikilinked by Claude, and written into the correct daily note under a collapsibl
 the audio embedded for inline playback. Kit texts Alex only when a word is garbled or a link
 is a guess.
 
+It also renames each memo in the Voice Memos app itself (so the app shows a meaningful,
+dated title that syncs to iPhone) — see the rename runner below.
+
 See [SPEC.md](./SPEC.md) for the full design. Runs on the Mac Mini via launchd.
 
 ## Status
 
-Live since 2026-06-29 (Mac Mini), fully autonomous since 2026-06-30. launchd agent
-`com.alexpriest.voice-memo-transcribe` watches the Recordings dir + a 06:30 daily catch-up.
+Live since 2026-06-29 (Mac Mini), fully autonomous since 2026-06-30. Two launchd agents:
+- `com.alexpriest.voice-memo-transcribe` — watches the Recordings dir + 06:30 catch-up; transcribes.
+- `com.alexpriest.voice-memo-rename` — every 180s, renames the app backlog when it's safe (below).
+
 History seeded/ignored; only new memos are processed.
 
-## Full Disk Access (required)
+## App rename runner
 
-The Voice Memos container is TCC-protected, so the background job needs **Full Disk Access**
-granted to its interpreter: `.venv/bin/python3.11` (a standalone `--copies` binary, so the
-grant is scoped to this tool). Without it the job dies with `PermissionError` on
-`CloudRecordings.db`. Grant via System Settings → Privacy & Security → Full Disk Access → +.
-The venv is built with `--copies` specifically so this binary is independently grantable.
+Apple exposes no rename API and a raw DB write doesn't sync, so the runner drives the real
+**Voice Memos → File → Rename** UI via AppleScript/Accessibility (which *does* sync via CloudKit).
+It only touches the UI when it's safe: the screen must be **unlocked** and the user **idle ≥ 120s**
+(Quartz `CGSSessionScreenIsLocked` + `CGEventSourceSecondsSinceLastEventType`). It `caffeinate`s
+the display during a pass and stops the instant input resumes. Note: it cannot run while iPhone
+Mirroring is active (that locks the Mac). Backlog is tracked in the ledger (`app_renamed`).
+Run on demand (bypass the idle gate): `python process_voice_memos.py --rename-queue --force`.
+
+## Permissions (required — two grants, same binary)
+
+Both target `.venv/bin/python3.11` (a standalone `--copies` binary, so grants are scoped to this
+tool). System Settings → Privacy & Security:
+- **Full Disk Access** — to READ the TCC-protected Voice Memos container. Without it the job dies
+  with `PermissionError` on `CloudRecordings.db`.
+- **Accessibility** — to DRIVE the Voice Memos rename UI. Without it the rename runner can't
+  control the app.
 
 ## Install (after build)
 

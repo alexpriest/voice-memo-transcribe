@@ -77,9 +77,11 @@ INNER_CIRCLE = [
      "who": "AJ's wife, family friend (default for 'Ash' unless context clearly means a work 'Ash')"},
 ]
 
-# Write the generated title back into the Voice Memos app DB (local Mac only).
-# Off by default — Apple's store is CloudKit-backed and raw writes don't reliably sync.
-RENAME_IN_APP = False
+# App rename runner (--rename-queue): drives the real Voice Memos File>Rename UI so the
+# rename syncs via CloudKit. Only fires when the screen is unlocked and the user has been
+# idle (so it never grabs the cursor mid-use). Needs Full Disk Access AND Accessibility.
+RENAME_LOCK_PATH = TOOL_DIR / "state" / ".rename.lock"
+IDLE_THRESHOLD_S = 120  # user must be idle this long before we touch the UI
 
 # Whisper segment confidence thresholds -> "shaky" span
 LOW_AVG_LOGPROB = -1.0
@@ -91,11 +93,11 @@ def log(msg: str) -> None:
     print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
 
 
-def acquire_lock():
+def acquire_lock(path: Path = LOCK_PATH):
     """Single-instance guard via flock (auto-released on process exit — no stuck locks).
     Returns the held file object, or None if another instance holds it."""
-    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-    fd = open(LOCK_PATH, "w")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = open(path, "w")
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (BlockingIOError, OSError):
@@ -494,23 +496,180 @@ def copy_audio(memo: dict, title: str) -> str:
     return filename
 
 
-def rename_in_app(memo: dict, app_title: str) -> bool:
-    """Best-effort: write the title into the Voice Memos local DB so the app shows it.
-    Apple's store is CloudKit-backed — this updates the LOCAL Mac copy; it may not sync to
-    iPhone and can be reverted by iCloud. Gated behind RENAME_IN_APP."""
+# --------------------------------------------------------------------------- #
+# App rename runner (GUI automation → real File>Rename → syncs via CloudKit)
+# --------------------------------------------------------------------------- #
+def screen_locked() -> bool:
+    """True if the screen is locked (or state can't be read — fail safe)."""
     try:
-        con = sqlite3.connect(str(DB_PATH), timeout=5)
-        con.execute(
-            "UPDATE ZCLOUDRECORDING SET ZENCRYPTEDTITLE=?, ZCUSTOMLABELFORSORTING=? "
-            "WHERE ZUNIQUEID=?",
-            (app_title, app_title, memo["uid"]),
-        )
-        con.commit()
-        con.close()
+        import Quartz
+        d = Quartz.CGSessionCopyCurrentDictionary()
+        if not d:
+            return True
+        return bool(d.get("CGSSessionScreenIsLocked", 0))
+    except Exception:  # noqa: BLE001
         return True
-    except sqlite3.Error as e:
-        log(f"  app rename failed: {e}")
-        return False
+
+
+def idle_seconds() -> float:
+    """Seconds since the last keyboard/mouse input."""
+    try:
+        import Quartz
+        return Quartz.CGEventSourceSecondsSinceLastEventType(
+            Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType
+        )
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def _as_escape(s: str) -> str:
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+RENAME_APPLESCRIPT = '''
+set newTitle to "{new}"
+set curTitle to "{cur}"
+set savedClip to ""
+try
+    set savedClip to the clipboard
+end try
+set the clipboard to newTitle
+tell application "VoiceMemos"
+    reopen
+    activate
+end tell
+delay 1.2
+tell application "System Events" to tell process "VoiceMemos"
+    try
+        set ec to entire contents of window 1
+    on error
+        set the clipboard to savedClip
+        return "NOWINDOW"
+    end try
+    set target to missing value
+    repeat with el in ec
+        if (role of el) is "AXTextField" then
+            try
+                if (value of el) is curTitle then
+                    set target to el
+                    exit repeat
+                end if
+            end try
+        end if
+    end repeat
+    if target is missing value then
+        set the clipboard to savedClip
+        return "NOFIELD"
+    end if
+    perform action "AXPress" of target
+    delay 0.5
+    try
+        click menu item "Rename…" of menu "File" of menu bar 1
+    end try
+    delay 0.5
+    keystroke "a" using command down
+    delay 0.15
+    keystroke "v" using command down
+    delay 0.3
+    key code 36
+    delay 0.6
+    set nv to (value of target)
+    set the clipboard to savedClip
+    if nv is newTitle then
+        return "OK"
+    end if
+    return "FAIL:" & nv
+end tell
+'''
+
+
+def gui_rename(current_title: str, new_title: str) -> str:
+    """Rename a recording via the real Voice Memos File>Rename UI. Returns
+    OK | NOFIELD | NOWINDOW | FAIL:<value> | ERR:<msg>."""
+    script = RENAME_APPLESCRIPT.format(new=_as_escape(new_title), cur=_as_escape(current_title))
+    try:
+        proc = subprocess.run(["osascript", "-"], input=script,
+                              capture_output=True, text=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return f"ERR:{e}"
+    if proc.returncode != 0:
+        return f"ERR:{proc.stderr.strip()[:120]}"
+    return proc.stdout.strip()
+
+
+def db_titles_by_uid() -> dict:
+    """uid -> current display title (ZENCRYPTEDTITLE) from the live DB."""
+    out = {}
+    for m in query_memos():
+        out[m["uid"]] = m["title"]
+    return out
+
+
+def rename_queue(args) -> int:
+    """Drain the app-rename backlog via GUI automation — only when it's safe to touch
+    the UI (unlocked + user idle). Each success syncs to all devices via CloudKit."""
+    lock = acquire_lock(RENAME_LOCK_PATH)
+    if lock is None:
+        log("rename: another pass in progress")
+        return 0
+
+    if not args.force:
+        if screen_locked():
+            log("rename: screen locked — skip")
+            return 0
+        idle = idle_seconds()
+        if idle < IDLE_THRESHOLD_S:
+            log(f"rename: in use (idle {idle:.0f}s < {IDLE_THRESHOLD_S}s) — skip")
+            return 0
+
+    ledger = load_ledger()
+    pending = [uid for uid, e in ledger.items()
+               if e.get("status") == "done" and not e.get("app_renamed")]
+    if not pending:
+        log("rename: nothing pending")
+        return 0
+
+    titles = db_titles_by_uid()
+    caff = subprocess.Popen(["caffeinate", "-d"])  # keep display awake during the pass
+    renamed = 0
+    try:
+        for uid in pending:
+            entry = ledger[uid]
+            recorded = entry.get("recorded")
+            date_prefix = recorded[:10] if recorded else datetime.now().strftime("%Y-%m-%d")
+            new_title = f"{date_prefix} — {entry.get('title')}"
+            current = titles.get(uid)
+            if current is None:
+                log(f"rename: {uid[:8]} not in DB (deleted?) — marking done")
+                entry["app_renamed"] = True
+                continue
+            if current == new_title:
+                entry["app_renamed"] = True
+                continue
+            result = gui_rename(current, new_title)
+            if result == "OK":
+                entry["app_renamed"] = True
+                renamed += 1
+                log(f"rename: ✓ {current!r} -> {new_title!r}")
+            elif result == "NOFIELD":
+                # title not in the list — likely already renamed on another device
+                log(f"rename: {uid[:8]} title {current!r} not found — marking done")
+                entry["app_renamed"] = True
+            elif result == "NOWINDOW":
+                log("rename: no Voice Memos window — aborting pass")
+                break
+            else:
+                log(f"rename: FAILED {current!r}: {result} — will retry next pass")
+            save_ledger(ledger)
+            # hand control back the moment the user returns
+            if not args.force and idle_seconds() < 5:
+                log("rename: user active — stopping pass")
+                break
+    finally:
+        caff.terminate()
+        save_ledger(ledger)
+    log(f"rename: pass done, {renamed} renamed")
+    return 0
 
 
 def append_activity(memo: dict, flags: list[str], title: str) -> None:
@@ -563,7 +722,14 @@ def main() -> int:
     ap.add_argument("--limit", type=int)
     ap.add_argument("--daemon", action="store_true",
                     help="launchd mode: single-instance lock + settle delay")
+    ap.add_argument("--rename-queue", action="store_true",
+                    help="drain the app-rename backlog via GUI (gated on unlock + idle)")
+    ap.add_argument("--force", action="store_true",
+                    help="with --rename-queue: bypass the unlock/idle gate (manual test)")
     args = ap.parse_args()
+
+    if args.rename_queue:
+        return rename_queue(args)
 
     if args.daemon:
         lock = acquire_lock()
@@ -648,13 +814,15 @@ def main() -> int:
         callout = build_callout(m, audio_filename, body, uncertainties, clever_title)
         insert_callout(note_path, callout, m["uid"])
         append_activity(m, uncertainties, clever_title)
-        renamed = rename_in_app(m, app_title) if RENAME_IN_APP else False
+        # app rename is handled asynchronously by the --rename-queue runner when the
+        # screen is unlocked and idle (see rename_queue); transcription never touches the UI.
         ledger[m["uid"]] = {
             "status": "done",
             "note": str(note_path.relative_to(VAULT)),
+            "recorded": m["recorded"].isoformat(timespec="seconds"),
             "orig_title": m["title"],
             "title": clever_title,
-            "app_renamed": renamed,
+            "app_renamed": False,
             "flags": uncertainties,
             "processed_at": datetime.now().isoformat(timespec="seconds"),
         }
