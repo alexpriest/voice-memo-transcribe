@@ -216,20 +216,20 @@ def transcribe(audio: Path) -> dict:
 # Enrich (Claude)
 # ---------------------------------------------------------------------------- #
 def build_entities() -> str:
+    # Only include people who have an alias set — the curated shortlist Alex actually refers
+    # to by nickname in speech. Dumping all ~1100 People notes bloats the prompt and times the
+    # model out for no benefit. An alias is Alex's opt-in: "link this person in my memos."
     lines = []
     people_dir = VAULT / "People"
-    count = 0
+    inner_notes = {p["note"] for p in INNER_CIRCLE}
     if people_dir.exists():
         for md in sorted(people_dir.glob("*.md")):
-            if md.stem.startswith("_") or count >= 500:
+            if md.stem.startswith("_") or md.stem in inner_notes:
                 continue
             aliases = parse_aliases(md)
             if aliases:
                 lines.append(f"- {md.stem} ({', '.join(aliases)})")
-            else:
-                lines.append(f"- {md.stem}")
-            count += 1
-    people_block = "\n".join(lines) if lines else "(none found)"
+    people_block = "\n".join(lines) if lines else "(none)"
 
     inner = "\n".join(
         f"- [[{p['note']}]] — say/mishear: {', '.join(p['refs'])} ({p['who']})"
@@ -302,11 +302,14 @@ NOTIFY_ENABLED: {notify_enabled}
 
 Never use emojis anywhere — not in the title, the transcript, the flags, or the SMS.
 
-OUTPUT — a single minified JSON object and NOTHING else:
-{{"title": "<short clever title>", \
-"cleaned_markdown": "<the cleaned body with wikilinks and [unclear] markers>", \
-"uncertainties": ["<short human-readable flag>", ...], \
-"should_notify": <true|false>, "notify_text": "<sms text or empty string>"}}
+OUTPUT — use EXACTLY this layout, nothing before or after it. Do not use JSON. The body after \
+the marker is freeform (put the whole cleaned transcript there, no escaping needed):
+TITLE: <short clever title>
+NOTIFY: <yes or no>
+NOTIFY_TEXT: <the SMS if NOTIFY is yes, otherwise leave blank>
+FLAGS: <each flag separated by " | ", or blank if none>
+===BODY===
+<the cleaned transcript with [[wikilinks]] and [unclear: ...] markers — multiple paragraphs>
 """
 
 
@@ -320,8 +323,8 @@ def enrich(memo: dict, transcription: dict, entities: str, notify_enabled: bool)
         )
     else:
         notify_instruction = (
-            "Do NOT send any message and do NOT use any tools — only return the JSON "
-            "(still fill notify_text with what you would have sent)."
+            "Do NOT send any message and do NOT use any tools — only return the output "
+            "(still fill NOTIFY_TEXT with what you would have sent)."
         )
 
     prompt = PROMPT_TEMPLATE.format(
@@ -346,13 +349,13 @@ def enrich(memo: dict, transcription: dict, entities: str, notify_enabled: bool)
     for attempt in range(1, 4):
         try:
             proc = subprocess.run(
-                cmd, cwd=str(VAULT), capture_output=True, text=True, timeout=300
+                cmd, cwd=str(VAULT), capture_output=True, text=True, timeout=420
             )
         except (subprocess.TimeoutExpired, OSError) as e:
             log(f"  enrich attempt {attempt} error: {e}")
         else:
             if proc.returncode == 0:
-                parsed = parse_json(proc.stdout)
+                parsed = parse_enrich(proc.stdout)
                 if parsed:
                     return parsed
                 log(f"  enrich attempt {attempt}: unparseable stdout: {proc.stdout[:200]!r}")
@@ -364,20 +367,32 @@ def enrich(memo: dict, transcription: dict, entities: str, notify_enabled: bool)
     return None
 
 
-def parse_json(raw: str) -> dict | None:
-    raw = raw.strip()
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        pass
-    start, end = raw.find("{"), raw.rfind("}")
-    if start != -1 and end > start:
-        try:
-            return json.loads(raw[start:end + 1])
-        except json.JSONDecodeError:
-            pass
-    log(f"  could not parse enrich JSON from: {raw[:200]}")
-    return None
+def parse_enrich(raw: str) -> dict | None:
+    """Parse the delimiter-based enrich output. Robust for arbitrarily long bodies
+    (the transcript lives after ===BODY=== as freeform text — no JSON escaping)."""
+    if "===BODY===" not in raw:
+        log(f"  enrich: no BODY marker in: {raw[:160]!r}")
+        return None
+    head, body = raw.split("===BODY===", 1)
+    body = body.strip()
+    if not body:
+        return None
+    fields = {"title": "", "notify": "", "notify_text": "", "flags": ""}
+    keys = (("title", "TITLE:"), ("notify", "NOTIFY:"),
+            ("notify_text", "NOTIFY_TEXT:"), ("flags", "FLAGS:"))
+    for line in head.splitlines():
+        for key, prefix in keys:
+            if line.strip().upper().startswith(prefix):
+                fields[key] = line.split(":", 1)[1].strip()
+                break
+    flags = [f.strip() for f in fields["flags"].split("|") if f.strip()]
+    return {
+        "title": fields["title"],
+        "cleaned_markdown": body,
+        "uncertainties": flags,
+        "should_notify": fields["notify"].lower().startswith("y"),
+        "notify_text": fields["notify_text"],
+    }
 
 
 # ---------------------------------------------------------------------------- #
@@ -694,6 +709,10 @@ def append_activity(memo: dict, flags: list[str], title: str) -> None:
 # Main
 # ---------------------------------------------------------------------------- #
 def select_memos(memos: list[dict], ledger: dict, args) -> list[dict]:
+    if args.uids:
+        wanted = {u.strip() for u in args.uids.split(",") if u.strip()}
+        out = [m for m in memos if m["uid"] in wanted]  # forced, ignore ledger status
+        return out[: args.limit] if args.limit else out
     out = []
     for m in memos:
         entry = ledger.get(m["uid"])
@@ -715,6 +734,7 @@ def select_memos(memos: list[dict], ledger: dict, args) -> list[dict]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--backfill-since")
+    ap.add_argument("--uids", help="comma-separated ZUNIQUEIDs to force-process")
     ap.add_argument("--seed-ledger", action="store_true")
     ap.add_argument("--raw", action="store_true")
     ap.add_argument("--no-notify", action="store_true")
