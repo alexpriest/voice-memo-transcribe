@@ -541,14 +541,9 @@ def _as_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
-RENAME_APPLESCRIPT = '''
-set newTitle to "{new}"
-set curTitle to "{cur}"
-set savedClip to ""
-try
-    set savedClip to the clipboard
-end try
-set the clipboard to newTitle
+# Step 1: bring the window up and return the CENTER SCREEN COORDS of the row whose title
+# matches — so we can click it deterministically. AXPress does not reliably change selection.
+LOCATE_APPLESCRIPT = '''
 tell application "VoiceMemos"
     reopen
     activate
@@ -558,26 +553,29 @@ tell application "System Events" to tell process "VoiceMemos"
     try
         set ec to entire contents of window 1
     on error
-        set the clipboard to savedClip
         return "NOWINDOW"
     end try
-    set target to missing value
     repeat with el in ec
         if (role of el) is "AXTextField" then
             try
-                if (value of el) is curTitle then
-                    set target to el
-                    exit repeat
+                if (value of el) is "{cur}" then
+                    set p to position of el
+                    set s to size of el
+                    set cx to (item 1 of p) + ((item 1 of s) div 2)
+                    set cy to (item 2 of p) + ((item 2 of s) div 2)
+                    return (cx as string) & "," & (cy as string)
                 end if
             end try
         end if
     end repeat
-    if target is missing value then
-        set the clipboard to savedClip
-        return "NOFIELD"
-    end if
-    perform action "AXPress" of target
-    delay 0.5
+    return "NOFIELD"
+end tell
+'''
+
+# Step 2 (after the click has selected the right row): invoke the real File>Rename and paste.
+APPLY_APPLESCRIPT = '''
+tell application "System Events" to tell process "VoiceMemos"
+    delay 0.3
     try
         click menu item "Rename…" of menu "File" of menu bar 1
     end try
@@ -587,42 +585,45 @@ tell application "System Events" to tell process "VoiceMemos"
     keystroke "v" using command down
     delay 0.3
     key code 36
-    delay 0.6
-    -- verify by rescanning (the target ref goes stale once the list re-sorts)
-    set found to false
-    try
-        repeat with el in (entire contents of window 1)
-            if (role of el) is "AXTextField" then
-                try
-                    if (value of el) is newTitle then
-                        set found to true
-                        exit repeat
-                    end if
-                end try
-            end if
-        end repeat
-    end try
-    set the clipboard to savedClip
-    if found then
-        return "OK"
-    end if
-    return "FAIL:unverified"
+    delay 0.4
 end tell
+return "DONE"
 '''
 
 
-def gui_rename(current_title: str, new_title: str) -> str:
-    """Rename a recording via the real Voice Memos File>Rename UI. Returns
-    OK | NOFIELD | NOWINDOW | FAIL:<value> | ERR:<msg>."""
-    script = RENAME_APPLESCRIPT.format(new=_as_escape(new_title), cur=_as_escape(current_title))
+def _osascript(script: str, timeout: int = 30) -> str:
     try:
         proc = subprocess.run(["osascript", "-"], input=script,
-                              capture_output=True, text=True, timeout=30)
+                              capture_output=True, text=True, timeout=timeout)
     except (subprocess.TimeoutExpired, OSError) as e:
         return f"ERR:{e}"
     if proc.returncode != 0:
         return f"ERR:{proc.stderr.strip()[:120]}"
     return proc.stdout.strip()
+
+
+def _click_at(x: int, y: int) -> None:
+    import Quartz
+    for kind in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+        ev = Quartz.CGEventCreateMouseEvent(None, kind, (x, y), Quartz.kCGMouseButtonLeft)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+
+
+def gui_rename(current_title: str, new_title: str) -> str:
+    """Rename a recording via the real Voice Memos File>Rename UI. A hardware-style click
+    at the row's coordinates deterministically selects it (AXPress does not). Returns
+    DONE | NOFIELD | NOWINDOW | ERR:<msg>. Caller verifies success against the DB."""
+    loc = _osascript(LOCATE_APPLESCRIPT.format(cur=_as_escape(current_title)))
+    if loc in ("NOFIELD", "NOWINDOW") or loc.startswith("ERR:"):
+        return loc
+    try:
+        x, y = (int(v) for v in loc.split(","))
+    except ValueError:
+        return f"ERR:badcoords:{loc[:40]}"
+    subprocess.run(["pbcopy"], input=new_title, text=True)  # clipboard = new title
+    _click_at(x, y)          # select the target row
+    time.sleep(0.5)
+    return _osascript(APPLY_APPLESCRIPT)
 
 
 def db_titles_by_uid() -> dict:
@@ -675,20 +676,31 @@ def rename_queue(args) -> int:
                 entry["app_renamed"] = True
                 continue
             result = gui_rename(current, new_title)
-            if result == "OK":
-                entry["app_renamed"] = True
-                renamed += 1
-                log(f"rename: ✓ {current!r} -> {new_title!r}")
-            elif result == "NOFIELD":
-                # title not in the list — likely already renamed on another device
-                log(f"rename: {uid[:8]} title {current!r} not found — marking done")
-                entry["app_renamed"] = True
-            elif result == "NOWINDOW":
+            if result == "NOWINDOW":
                 log("rename: no Voice Memos window — aborting pass")
                 break
+            if result == "NOFIELD":
+                # not in the list — only mark done if the DB confirms it's already renamed
+                if db_titles_by_uid().get(uid) == new_title:
+                    entry["app_renamed"] = True
+                    log(f"rename: {uid[:8]} already renamed — marking done")
+                else:
+                    log(f"rename: {uid[:8]} field {current!r} not found, not renamed — leaving pending")
+                save_ledger(ledger)
+                continue
+            # result == DONE: verify against the AUTHORITATIVE DB, not the AX tree.
+            # If the wrong memo changed (this uid's title didn't take), STOP — don't risk
+            # corrupting more titles.
+            fresh = db_titles_by_uid().get(uid)
+            if fresh == new_title:
+                entry["app_renamed"] = True
+                renamed += 1
+                save_ledger(ledger)
+                log(f"rename: ✓ {current!r} -> {new_title!r}")
             else:
-                log(f"rename: FAILED {current!r}: {result} — will retry next pass")
-            save_ledger(ledger)
+                log(f"rename: MISMATCH — {uid[:8]} still {fresh!r}, wanted {new_title!r}. "
+                    f"Selection likely hit the wrong row; STOPPING pass to avoid corruption.")
+                break
             # Can't use idle here — our own synthetic keystrokes reset the idle timer.
             # Stop only on a real user action we can detect: locking the screen.
             if not args.force and screen_locked():
