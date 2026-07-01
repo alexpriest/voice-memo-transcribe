@@ -541,89 +541,87 @@ def _as_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
-# Step 1: bring the window up and return the CENTER SCREEN COORDS of the row whose title
-# matches — so we can click it deterministically. AXPress does not reliably change selection.
-LOCATE_APPLESCRIPT = '''
+# Rename via the real File>Rename UI, with a hard safety gate: after opening Rename we read
+# the title that is actually in the edit box (the AXFocusedUIElement) and confirm it equals the
+# memo we intend to rename. If it doesn't match (wrong row selected, virtualized list, etc.) we
+# press Escape and abort. Worst case is "didn't rename" — it can NEVER rename the wrong memo.
+RENAME_APPLESCRIPT = '''
+set expected to "{cur}"
+set newTitle to "{new}"
+set savedClip to ""
+try
+    set savedClip to the clipboard
+end try
+set the clipboard to newTitle
 tell application "VoiceMemos"
     reopen
     activate
 end tell
 delay 1.2
-tell application "System Events" to tell process "VoiceMemos"
+tell application "System Events"
+    set proc to process "VoiceMemos"
     try
-        set ec to entire contents of window 1
+        set ec to entire contents of window 1 of proc
     on error
+        set the clipboard to savedClip
         return "NOWINDOW"
     end try
+    set target to missing value
     repeat with el in ec
         if (role of el) is "AXTextField" then
             try
-                if (value of el) is "{cur}" then
-                    set p to position of el
-                    set s to size of el
-                    set cx to (item 1 of p) + ((item 1 of s) div 2)
-                    set cy to (item 2 of p) + ((item 2 of s) div 2)
-                    return (cx as string) & "," & (cy as string)
+                if (value of el) is expected then
+                    set target to el
+                    exit repeat
                 end if
             end try
         end if
     end repeat
-    return "NOFIELD"
-end tell
-'''
-
-# Step 2 (after the click has selected the right row): invoke the real File>Rename and paste.
-APPLY_APPLESCRIPT = '''
-tell application "System Events" to tell process "VoiceMemos"
-    delay 0.3
+    if target is missing value then
+        set the clipboard to savedClip
+        return "NOFIELD"
+    end if
+    perform action "AXPress" of target
+    delay 0.4
     try
-        click menu item "Rename…" of menu "File" of menu bar 1
+        click menu item "Rename…" of menu "File" of menu bar 1 of proc
     end try
     delay 0.5
+    set editVal to ""
+    try
+        set fe to value of attribute "AXFocusedUIElement" of proc
+        set editVal to (value of fe) as string
+    end try
+    if editVal is not expected then
+        key code 53
+        set the clipboard to savedClip
+        return "WRONGSEL"
+    end if
     keystroke "a" using command down
     delay 0.15
     keystroke "v" using command down
     delay 0.3
     key code 36
-    delay 0.4
+    delay 0.5
+    set the clipboard to savedClip
+    return "DONE"
 end tell
-return "DONE"
 '''
 
 
-def _osascript(script: str, timeout: int = 30) -> str:
+def gui_rename(current_title: str, new_title: str) -> str:
+    """Rename a recording via the real Voice Memos File>Rename UI, gated on verifying the
+    edit box holds the expected current title before typing. Returns
+    DONE | WRONGSEL | NOFIELD | NOWINDOW | ERR:<msg>. Caller also verifies against the DB."""
+    script = RENAME_APPLESCRIPT.format(cur=_as_escape(current_title), new=_as_escape(new_title))
     try:
         proc = subprocess.run(["osascript", "-"], input=script,
-                              capture_output=True, text=True, timeout=timeout)
+                              capture_output=True, text=True, timeout=30)
     except (subprocess.TimeoutExpired, OSError) as e:
         return f"ERR:{e}"
     if proc.returncode != 0:
         return f"ERR:{proc.stderr.strip()[:120]}"
     return proc.stdout.strip()
-
-
-def _click_at(x: int, y: int) -> None:
-    import Quartz
-    for kind in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
-        ev = Quartz.CGEventCreateMouseEvent(None, kind, (x, y), Quartz.kCGMouseButtonLeft)
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-
-
-def gui_rename(current_title: str, new_title: str) -> str:
-    """Rename a recording via the real Voice Memos File>Rename UI. A hardware-style click
-    at the row's coordinates deterministically selects it (AXPress does not). Returns
-    DONE | NOFIELD | NOWINDOW | ERR:<msg>. Caller verifies success against the DB."""
-    loc = _osascript(LOCATE_APPLESCRIPT.format(cur=_as_escape(current_title)))
-    if loc in ("NOFIELD", "NOWINDOW") or loc.startswith("ERR:"):
-        return loc
-    try:
-        x, y = (int(v) for v in loc.split(","))
-    except ValueError:
-        return f"ERR:badcoords:{loc[:40]}"
-    subprocess.run(["pbcopy"], input=new_title, text=True)  # clipboard = new title
-    _click_at(x, y)          # select the target row
-    time.sleep(0.5)
-    return _osascript(APPLY_APPLESCRIPT)
 
 
 def db_titles_by_uid() -> dict:
@@ -679,18 +677,25 @@ def rename_queue(args) -> int:
             if result == "NOWINDOW":
                 log("rename: no Voice Memos window — aborting pass")
                 break
+            if result == "WRONGSEL":
+                # the edit box didn't hold the expected title — aborted safely, nothing renamed
+                log(f"rename: {uid[:8]} couldn't isolate {current!r} (list virtualized?) — "
+                    f"skipped safely, retry next pass")
+                continue
             if result == "NOFIELD":
-                # not in the list — only mark done if the DB confirms it's already renamed
+                # not visible in the list — only mark done if the DB confirms it's already renamed
                 if db_titles_by_uid().get(uid) == new_title:
                     entry["app_renamed"] = True
                     log(f"rename: {uid[:8]} already renamed — marking done")
                 else:
-                    log(f"rename: {uid[:8]} field {current!r} not found, not renamed — leaving pending")
+                    log(f"rename: {uid[:8]} field {current!r} not visible, not renamed — leaving pending")
                 save_ledger(ledger)
                 continue
-            # result == DONE: verify against the AUTHORITATIVE DB, not the AX tree.
-            # If the wrong memo changed (this uid's title didn't take), STOP — don't risk
-            # corrupting more titles.
+            if result != "DONE":
+                log(f"rename: {uid[:8]} unexpected result {result!r} — leaving pending")
+                continue
+            # DONE: confirm against the authoritative DB (the pre-verify already prevents
+            # renaming the wrong memo, so a mismatch here just means it didn't take).
             fresh = db_titles_by_uid().get(uid)
             if fresh == new_title:
                 entry["app_renamed"] = True
@@ -698,9 +703,7 @@ def rename_queue(args) -> int:
                 save_ledger(ledger)
                 log(f"rename: ✓ {current!r} -> {new_title!r}")
             else:
-                log(f"rename: MISMATCH — {uid[:8]} still {fresh!r}, wanted {new_title!r}. "
-                    f"Selection likely hit the wrong row; STOPPING pass to avoid corruption.")
-                break
+                log(f"rename: {uid[:8]} didn't take (db {fresh!r}) — leaving pending")
             # Can't use idle here — our own synthetic keystrokes reset the idle timer.
             # Stop only on a real user action we can detect: locking the screen.
             if not args.force and screen_locked():
