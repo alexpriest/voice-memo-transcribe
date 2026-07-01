@@ -588,12 +588,25 @@ tell application "System Events" to tell process "VoiceMemos"
     delay 0.3
     key code 36
     delay 0.6
-    set nv to (value of target)
+    -- verify by rescanning (the target ref goes stale once the list re-sorts)
+    set found to false
+    try
+        repeat with el in (entire contents of window 1)
+            if (role of el) is "AXTextField" then
+                try
+                    if (value of el) is newTitle then
+                        set found to true
+                        exit repeat
+                    end if
+                end try
+            end if
+        end repeat
+    end try
     set the clipboard to savedClip
-    if nv is newTitle then
+    if found then
         return "OK"
     end if
-    return "FAIL:" & nv
+    return "FAIL:unverified"
 end tell
 '''
 
@@ -676,9 +689,10 @@ def rename_queue(args) -> int:
             else:
                 log(f"rename: FAILED {current!r}: {result} — will retry next pass")
             save_ledger(ledger)
-            # hand control back the moment the user returns
-            if not args.force and idle_seconds() < 5:
-                log("rename: user active — stopping pass")
+            # Can't use idle here — our own synthetic keystrokes reset the idle timer.
+            # Stop only on a real user action we can detect: locking the screen.
+            if not args.force and screen_locked():
+                log("rename: screen locked mid-pass — stopping")
                 break
     finally:
         caff.terminate()
