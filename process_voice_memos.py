@@ -128,7 +128,7 @@ def save_ledger(ledger: dict) -> None:
 # ---------------------------------------------------------------------------- #
 # Detect
 # ---------------------------------------------------------------------------- #
-def query_memos() -> list[dict]:
+def query_memos(min_duration: float = MIN_DURATION_S) -> list[dict]:
     """Copy the live DB (+wal/+shm) to temp and read it read-only."""
     if not DB_PATH.exists():
         log(f"ERROR no CloudRecordings.db at {DB_PATH}")
@@ -155,7 +155,7 @@ def query_memos() -> list[dict]:
               AND ZDURATION >= ?
             ORDER BY ZDATE ASC
             """,
-            (MIN_DURATION_S,),
+            (min_duration,),
         ).fetchall()
         con.close()
 
@@ -581,18 +581,44 @@ tell application "System Events"
         set the clipboard to savedClip
         return "NOFIELD"
     end if
-    perform action "AXPress" of target
+    -- The row container is an AXButton; pressing the text field itself does NOT move
+    -- selection (File>Rename would then act on whatever was already selected).
+    -- Walk up to the row button and select/press that instead.
+    set rowBtn to missing value
+    set cur to target
+    repeat with i from 1 to 5
+        set p to value of attribute "AXParent" of cur
+        if (role of p) is "AXButton" then
+            set rowBtn to p
+            exit repeat
+        end if
+        set cur to p
+    end repeat
+    if rowBtn is missing value then
+        set the clipboard to savedClip
+        return "NOROW"
+    end if
+    try
+        set value of attribute "AXSelected" of rowBtn to true
+    on error
+        perform action "AXPress" of rowBtn
+    end try
     delay 0.4
     try
         click menu item "Rename…" of menu "File" of menu bar 1 of proc
     end try
     delay 0.5
-    set editVal to ""
+    -- Gate on the EXACT element we matched: after Rename opens, the target text field
+    -- itself must report AXFocused=true and still hold the expected title. (The
+    -- process-level AXFocusedUIElement misreports as the row button — do not use it.)
+    -- If some other row entered edit mode, our field reads focused=false -> abort.
+    set gateOK to false
     try
-        set fe to value of attribute "AXFocusedUIElement" of proc
-        set editVal to (value of fe) as string
+        if ((value of attribute "AXFocused" of target) is true) and ((value of target) is expected) then
+            set gateOK to true
+        end if
     end try
-    if editVal is not expected then
+    if not gateOK then
         key code 53
         set the clipboard to savedClip
         return "WRONGSEL"
@@ -656,7 +682,11 @@ def rename_queue(args) -> int:
         log("rename: nothing pending")
         return 0
 
-    titles = db_titles_by_uid()
+    # No duration filter here: sub-3s junk recordings are invisible to the transcribe
+    # pipeline but still occupy rows in the app, and default titles ("New Recording N")
+    # can collide with them.
+    all_memos = query_memos(min_duration=0.0)
+    titles = {m["uid"]: m["title"] for m in all_memos}
     caff = subprocess.Popen(["caffeinate", "-d"])  # keep display awake during the pass
     renamed = 0
     try:
@@ -673,6 +703,16 @@ def rename_queue(args) -> int:
             if current == new_title:
                 entry["app_renamed"] = True
                 continue
+            # The AX pass targets the FIRST row matching the title (topmost = newest).
+            # If another memo shares this title and ours isn't the newest, that first
+            # match would be the wrong memo — skip and flag for manual handling.
+            same_title = [m for m in all_memos if m["title"] == current]
+            if len(same_title) > 1:
+                newest = max(same_title, key=lambda m: m["recorded"])
+                if newest["uid"] != uid:
+                    log(f"rename: {uid[:8]} title {current!r} duplicated in app and target "
+                        f"isn't the newest — skipping (retitle the other memo to unblock)")
+                    continue
             result = gui_rename(current, new_title)
             if result == "NOWINDOW":
                 log("rename: no Voice Memos window — aborting pass")
