@@ -147,6 +147,22 @@ texts a single heads-up. A memo is never lost.
   iCloud/recording writes settle, then processes only finalized + unprocessed memos. Cheap no-op
   when nothing is new (WatchPaths can fire many times mid-recording).
 
+## Call gate (added 2026-07-07)
+
+Both runners skip while the **camera or mic is in use** (Alex on a video call / any call /
+recording). Motivation: the rename runner drives the Voice Memos GUI and its idle gate makes it
+*likely* to fire mid-call (you sit idle at the keyboard while listening), stealing focus — and
+whisper competes with the call for the Neural Engine.
+
+- **Signal:** `bin/callguard`, a compiled Swift helper reading `kCMIODevicePropertyDeviceIsRunningSomewhere`
+  (CoreMediaIO / camera) + `kAudioDevicePropertyDeviceIsRunningSomewhere` (CoreAudio / mic). State-only
+  reads → no capture session, no TCC permission, no privacy indicator. Verified against a real call:
+  Studio Display Camera + AirPods read running=1; virtual "Teams Audio" reads 0 (no stuck-on).
+- **Wiring:** `on_call()` in the orchestrator. Gates the `--daemon` run (defer before settle) and the
+  `--rename-queue` run (skip pre-pass + abort mid-pass if a call starts).
+- **Fails open:** missing/erroring helper → proceed, never a silent permanent halt. `--force` bypasses.
+- **Recovery:** deferred memos picked up by the next Recordings event or the 06:30 catch-up.
+
 ## Files
 
 ```
@@ -155,10 +171,12 @@ texts a single heads-up. A memo is never lost.
   README.md                                # what it is, install, ops, troubleshooting
   run.sh                                   # launchd entrypoint (bash + lockfile + settle)
   process_voice_memos.py                   # orchestrator (detect, transcribe, enrich, place)
+  bin/callguard.swift                      # camera/mic-in-use probe (source)
+  bin/callguard                            # compiled helper (gitignored; built by install.sh)
   requirements.txt                         # mlx-whisper
-  install.sh                               # venv, deps, model pre-download, plist load, gitignore
+  install.sh                               # venv, deps, model, callguard build, plist load, gitignore
   com.alexpriest.voice-memo-transcribe.plist   # plist template (paths substituted on install)
-  .gitignore                               # .venv/, state/, *.log
+  .gitignore                               # .venv/, state/, *.log, bin/callguard
   state/processed.json                     # ledger (gitignored)
 ```
 

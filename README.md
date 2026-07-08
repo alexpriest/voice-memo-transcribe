@@ -18,7 +18,10 @@ Live since 2026-06-29 (Mac Mini), fully autonomous since 2026-06-30. Two launchd
 - `com.alexpriest.voice-memo-transcribe` — watches the Recordings dir + 06:30 catch-up; transcribes.
 - `com.alexpriest.voice-memo-rename` — every 180s, renames the app backlog when it's safe (below).
 
-History seeded/ignored; only new memos are processed.
+History seeded/ignored; only new memos are processed. Source audio is matched by container:
+both `.m4a` and `.qta` (QuickTime-audio; Voice Memos uses it for some recordings). The four
+pre-seed `.qta` memos were seeded-as-ignored on 2026-07-08 when `.qta` support was added, so
+the filter only affects memos going forward.
 
 ## App rename runner
 
@@ -29,6 +32,30 @@ It only touches the UI when it's safe: the screen must be **unlocked** and the u
 the display during a pass and stops the instant input resumes. Note: it cannot run while iPhone
 Mirroring is active (that locks the Mac). Backlog is tracked in the ledger (`app_renamed`).
 Run on demand (bypass the idle gate): `python process_voice_memos.py --rename-queue --force`.
+
+**Backlog nudge.** On a headless/mostly-locked Mini the safe window can go days without opening,
+so a queued memo could sit unrenamed unseen. When a pass is gated (locked / on a call / user
+active) *and* memos are waiting, the runner texts Alex — **once per new memo** (fires only when
+the pending set grows, so a stuck item nudges once and never nags). Dedupe state lives in
+`state/rename_notify.json`. Clear that file to force a re-nudge.
+
+## Call gate (never runs while Alex is on a video call)
+
+Both runners skip themselves whenever the camera or microphone is in use — i.e. Alex is on a
+call or recording. This keeps the rename runner from yanking Voice Memos to the foreground
+mid-call (its idle gate otherwise *invites* it to fire while he's listening), and keeps the
+transcriber from hogging the Neural Engine and making the call choppy.
+
+Detection is a tiny compiled Swift helper, `bin/callguard`, reading CoreMediaIO's
+`kCMIODevicePropertyDeviceIsRunningSomewhere` (camera) + CoreAudio's equivalent (mic). It reads
+hardware *state* only — no capture session, so it needs **no** camera/mic permission and never
+trips the privacy indicator. Virtual devices (Teams/Zoom audio) correctly read idle, so the gate
+never gets stuck permanently "on."
+
+It **fails open**: if the helper is missing or errors, the runners proceed rather than halt — a
+broken probe must never silently stop transcription. `--force` (manual rename drain) bypasses the
+gate along with the idle/lock gates. Deferred memos are retried by the next memo event or the
+06:30 catch-up. Rebuild the helper: `swiftc -O -framework CoreMediaIO -framework CoreAudio bin/callguard.swift -o bin/callguard`.
 
 ## Permissions (required — two grants, same binary)
 

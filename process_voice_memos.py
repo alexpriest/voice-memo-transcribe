@@ -46,6 +46,8 @@ DB_PATH = RECORDINGS_DIR / "CloudRecordings.db"
 TOOL_DIR = Path(__file__).resolve().parent
 LEDGER_PATH = TOOL_DIR / "state" / "processed.json"
 LOCK_PATH = TOOL_DIR / "state" / ".lock"
+RENAME_NOTIFY_PATH = TOOL_DIR / "state" / "rename_notify.json"  # backlog-nudge dedupe state
+CALLGUARD_BIN = TOOL_DIR / "bin" / "callguard"  # camera/mic-in-use probe (see bin/callguard.swift)
 SETTLE_SECONDS = 25  # let recording / iCloud writes finish before reading the container
 AUDIO_DEST = VAULT / "System" / "Voice Memos" / "Audio"
 DAILY_DIR = VAULT / "Daily"
@@ -151,7 +153,7 @@ def query_memos(min_duration: float = MIN_DURATION_S) -> list[dict]:
                    ZDURATION    AS duration,
                    ZPATH        AS path
             FROM ZCLOUDRECORDING
-            WHERE ZPATH LIKE '%.m4a'
+            WHERE (ZPATH LIKE '%.m4a' OR ZPATH LIKE '%.qta')
               AND ZDURATION >= ?
             ORDER BY ZDATE ASC
             """,
@@ -514,6 +516,30 @@ def copy_audio(memo: dict, title: str) -> str:
 # --------------------------------------------------------------------------- #
 # App rename runner (GUI automation → real File>Rename → syncs via CloudKit)
 # --------------------------------------------------------------------------- #
+def on_call() -> tuple[bool, str]:
+    """(True, reason) if the camera or mic is currently in use by any app — i.e. Alex is
+    on a video call (camera) or any call/recording (mic). Used to keep this automation from
+    stealing focus into the Voice Memos UI or hogging the Neural Engine mid-call.
+
+    Reads hardware state via the compiled `bin/callguard` helper (CoreMediaIO + CoreAudio
+    'IsRunningSomewhere' — no capture session, no TCC prompt). FAILS OPEN: if the helper is
+    missing or errors, returns (False, ...) so a broken probe never permanently halts the
+    pipeline — better to occasionally run during a call than to silently stop transcribing."""
+    if not CALLGUARD_BIN.exists():
+        return False, "callguard helper missing — not gating"
+    try:
+        proc = subprocess.run([str(CALLGUARD_BIN)], capture_output=True, text=True, timeout=8)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return False, f"callguard error ({e}) — not gating"
+    if proc.returncode != 0:
+        return False, f"callguard exit {proc.returncode} — not gating"
+    out = proc.stdout.strip()
+    active = [name for name, token in (("camera", "camera=1"), ("mic", "mic=1")) if token in out]
+    if active:
+        return True, " + ".join(active) + " in use"
+    return False, out
+
+
 def screen_locked() -> bool:
     """True if the screen is locked (or state can't be read — fail safe)."""
     try:
@@ -658,6 +684,65 @@ def db_titles_by_uid() -> dict:
     return out
 
 
+def _send_sms(text: str) -> bool:
+    """Send a plain-text iMessage to Alex via the vault's kit-tools MCP — the same path
+    enrich() uses to notify. Returns True on success."""
+    prompt = (
+        f"Use the mcp__kit-tools__send_message tool to send this EXACT text to {PHONE} "
+        f"(and only that number). Send it verbatim, use no other tools, and write no files.\n\n"
+        f"{text}"
+    )
+    cmd = [CLAUDE_BIN, "-p", "--permission-mode", "bypassPermissions",
+           "--model", CLAUDE_MODEL, "--max-budget-usd", "0.20", prompt]
+    try:
+        proc = subprocess.run(cmd, cwd=str(VAULT), capture_output=True, text=True, timeout=120)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log(f"rename: notify send error: {e}")
+        return False
+    if proc.returncode != 0:
+        log(f"rename: notify exit {proc.returncode} stderr={proc.stderr[:160]!r}")
+        return False
+    return True
+
+
+def maybe_notify_backlog(pending: list[str], ledger: dict) -> None:
+    """When the rename runner is gated (screen locked / on a call / user active) but memos
+    are waiting, text Alex — ONCE per new memo. Fires only when the pending SET grows (a new
+    unrenamed memo appeared), so a genuinely-stuck item nudges once and never nags. Keeps a
+    stuck rename queue surfacing in hours, not days."""
+    if not pending:
+        return
+    state = {}
+    if RENAME_NOTIFY_PATH.exists():
+        try:
+            state = json.loads(RENAME_NOTIFY_PATH.read_text())
+        except (ValueError, OSError):
+            state = {}
+    notified = set(state.get("notified_uids", []))
+    if all(uid in notified for uid in pending):
+        return  # same (or smaller) backlog — he already knows, stay quiet
+    lines = []
+    for uid in pending:
+        e = ledger.get(uid, {})
+        day = (e.get("recorded") or "")[:10] or "?"
+        lines.append(f'{day} "{e.get("title") or "untitled"}"')
+    n = len(pending)
+    body = (
+        f"Voice Memos rename queue stuck: {n} memo{'s' if n != 1 else ''} waiting "
+        f"(Mac screen locked or in use, so the auto-rename can't run). "
+        + "; ".join(lines)
+        + ". Unlock + step away from the Mini for 2 min, or tell Kit to force-drain."
+    )[:315]
+    if _send_sms(body):
+        try:
+            RENAME_NOTIFY_PATH.write_text(json.dumps(
+                {"notified_uids": pending,
+                 "last_notified": datetime.now().isoformat(timespec="seconds")}, indent=2))
+        except OSError as e:
+            log(f"rename: could not persist notify state: {e}")
+        log(f"rename: nudged Alex — {n} memo(s) pending")
+
+
 def rename_queue(args) -> int:
     """Drain the app-rename backlog via GUI automation — only when it's safe to touch
     the UI (unlocked + user idle). Each success syncs to all devices via CloudKit."""
@@ -666,18 +751,26 @@ def rename_queue(args) -> int:
         log("rename: another pass in progress")
         return 0
 
+    ledger = load_ledger()
+    pending = [uid for uid, e in ledger.items()
+               if e.get("status") == "done" and not e.get("app_renamed")]
+
     if not args.force:
         if screen_locked():
             log("rename: screen locked — skip")
+            maybe_notify_backlog(pending, ledger)
+            return 0
+        active, why = on_call()
+        if active:
+            log(f"rename: {why} — on a call, skip (would steal focus into Voice Memos)")
+            maybe_notify_backlog(pending, ledger)
             return 0
         idle = idle_seconds()
         if idle < IDLE_THRESHOLD_S:
             log(f"rename: in use (idle {idle:.0f}s < {IDLE_THRESHOLD_S}s) — skip")
+            maybe_notify_backlog(pending, ledger)
             return 0
 
-    ledger = load_ledger()
-    pending = [uid for uid, e in ledger.items()
-               if e.get("status") == "done" and not e.get("app_renamed")]
     if not pending:
         log("rename: nothing pending")
         return 0
@@ -745,10 +838,16 @@ def rename_queue(args) -> int:
             else:
                 log(f"rename: {uid[:8]} didn't take (db {fresh!r}) — leaving pending")
             # Can't use idle here — our own synthetic keystrokes reset the idle timer.
-            # Stop only on a real user action we can detect: locking the screen.
-            if not args.force and screen_locked():
-                log("rename: screen locked mid-pass — stopping")
-                break
+            # Stop on a real signal we can detect mid-pass: the screen locking, or a call
+            # starting (camera/mic goes live). Either means "hands off the UI now."
+            if not args.force:
+                if screen_locked():
+                    log("rename: screen locked mid-pass — stopping")
+                    break
+                active, why = on_call()
+                if active:
+                    log(f"rename: {why} mid-pass — call started, stopping")
+                    break
     finally:
         caff.terminate()
         save_ledger(ledger)
@@ -824,6 +923,10 @@ def main() -> int:
         lock = acquire_lock()
         if lock is None:
             log("another run in progress — exiting")
+            return 0
+        active, why = on_call()
+        if active:
+            log(f"{why} — on a call, deferring (next memo or the 06:30 catch-up retries)")
             return 0
         time.sleep(SETTLE_SECONDS)
 

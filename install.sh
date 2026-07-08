@@ -20,6 +20,10 @@ echo "==> pre-downloading whisper model"
 .venv/bin/python -c "from huggingface_hub import snapshot_download; \
 snapshot_download('mlx-community/whisper-large-v3-turbo')"
 
+echo "==> building callguard (skips both runners while Alex is on a call)"
+swiftc -O -framework CoreMediaIO -framework CoreAudio \
+    "$TOOL_DIR/bin/callguard.swift" -o "$TOOL_DIR/bin/callguard"
+
 echo "==> vault .gitignore (keep audio out of git + website sync)"
 if ! grep -qxF "$AUDIO_IGNORE" "$GITIGNORE" 2>/dev/null; then
     printf '\n# Voice memo audio — Mac-local, never committed or web-synced\n%s\n' "$AUDIO_IGNORE" >> "$GITIGNORE"

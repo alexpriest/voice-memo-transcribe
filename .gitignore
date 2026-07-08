@@ -3,3 +3,4 @@ state/
 *.log
 __pycache__/
 *.pyc
+bin/callguard
