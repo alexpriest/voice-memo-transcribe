@@ -53,6 +53,11 @@ AUDIO_DEST = VAULT / "System" / "Voice Memos" / "Audio"
 DAILY_DIR = VAULT / "Daily"
 ACTIVITY_DIR = VAULT / "Claude" / "System" / "Activity"
 
+# Where a finished memo is written: "craft" (a toggle on the Craft daily note,
+# which surfaces in Obsidian via the # Journal transclusion) or "obsidian" (the
+# original # Voice Memos callout in the vault daily note). Override with VOICE_DEST.
+DEST = os.environ.get("VOICE_DEST", "craft")
+
 PHONE = "+12702871307"
 WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
 CLAUDE_BIN = str(HOME / ".local" / "bin" / "claude")
@@ -433,7 +438,9 @@ def daily_note_stub(dt: datetime) -> str:
         f'daily-date: "{dt:%Y-%m-%d}T00:00:00"\n'
         "cssclasses:\n  - hide-properties\n"
         "---\n"
-        "# Morning Pages\n\n*Morning pages go here.*\n\n---\n\n# Jots\n"
+        # Keep in sync with System/Templates/Daily Note Template.md: the Journal
+        # section transcludes the mirrored Craft daily note (his journaling home).
+        f"# Journal\n\n![[Craft/Daily Notes/{dt:%Y}/{dt:%m-%B}/{dt:%Y-%m-%d}]]\n\n---\n\n# Jots\n"
     )
 
 
@@ -497,6 +504,34 @@ def insert_callout(note_path: Path, callout: str, uid: str) -> None:
                 text += "\n"
             text += block
     note_path.write_text(text)
+
+
+def pretty_audio_name(memo: dict, title: str) -> str:
+    shortid = memo["uid"].split("-")[0][:8]
+    return f"{memo['recorded']:%Y-%m-%d %H%M} {slugify(title)} {shortid}.m4a"
+
+
+def place_in_craft(memo: dict, body: str, uncertainties: list[str], title: str,
+                   prev_toggle_id: str | None = None) -> str:
+    """Write the memo as a toggle on the Craft daily note (transcript + audio inside).
+
+    Returns the toggle's block id — store it in the ledger so a reprocess replaces
+    this group instead of appending a duplicate.
+    """
+    import craft_write
+    shortid = memo["uid"].split("-")[0][:8]
+    return craft_write.write_voice_memo(
+        date=f"{memo['recorded']:%Y-%m-%d}",
+        title=title,
+        time_label=f"{memo['recorded']:%-I:%M %p}",
+        duration_label=fmt_duration(memo["duration"]),
+        transcript=body,
+        uncertainties=uncertainties,
+        audio_path=str(memo["audio"]),
+        pretty_name=pretty_audio_name(memo, title),
+        shortid=shortid,
+        prev_toggle_id=prev_toggle_id,
+    )["toggle_id"]
 
 
 def copy_audio(memo: dict, title: str) -> str:
@@ -995,26 +1030,41 @@ def main() -> int:
         app_title = f"{m['recorded']:%Y-%m-%d} — {clever_title}"
 
         if args.dry_run:
-            log(f"  [dry-run] title: {clever_title!r}  (app: {app_title!r})")
-            log("  [dry-run] would write callout:")
-            print(build_callout(m, "AUDIO.m4a", body, uncertainties, clever_title))
+            log(f"  [dry-run] dest={DEST}  title: {clever_title!r}  (app: {app_title!r})")
+            if DEST == "craft":
+                log(f"  [dry-run] would add Craft toggle to daily note {m['recorded']:%Y-%m-%d}:")
+                log(f"    ### Voice memo: {clever_title} · {m['recorded']:%-I:%M %p} · {fmt_duration(m['duration'])}")
+                log(f"    [transcript {len(body)} chars] + audio {pretty_audio_name(m, clever_title)!r}")
+            else:
+                log("  [dry-run] would write callout:")
+                print(build_callout(m, "AUDIO.m4a", body, uncertainties, clever_title))
             log(f"  [dry-run] should_notify={should_notify} notify_text={notify_text!r}")
             continue
 
-        audio_filename = copy_audio(m, clever_title)
-        note_path = daily_note_path(m["recorded"])
-        callout = build_callout(m, audio_filename, body, uncertainties, clever_title)
-        insert_callout(note_path, callout, m["uid"])
+        craft_toggle_id = None
+        if DEST == "craft":
+            craft_toggle_id = place_in_craft(
+                m, body, uncertainties, clever_title,
+                prev_toggle_id=(ledger.get(m["uid"]) or {}).get("craft_toggle_id"),
+            )
+            note_ref = f"Craft/Daily Notes/{m['recorded']:%Y/%m-%B/%Y-%m-%d} (toggle)"
+        else:
+            audio_filename = copy_audio(m, clever_title)
+            note_path = daily_note_path(m["recorded"])
+            callout = build_callout(m, audio_filename, body, uncertainties, clever_title)
+            insert_callout(note_path, callout, m["uid"])
+            note_ref = str(note_path.relative_to(VAULT))
         append_activity(m, uncertainties, clever_title)
         # app rename is handled asynchronously by the --rename-queue runner when the
         # screen is unlocked and idle (see rename_queue); transcription never touches the UI.
         ledger[m["uid"]] = {
             "status": "done",
-            "note": str(note_path.relative_to(VAULT)),
+            "note": note_ref,
             "recorded": m["recorded"].isoformat(timespec="seconds"),
             "orig_title": m["title"],
             "title": clever_title,
             "app_renamed": False,
+            "craft_toggle_id": craft_toggle_id,
             "flags": uncertainties,
             "processed_at": datetime.now().isoformat(timespec="seconds"),
         }
@@ -1023,7 +1073,7 @@ def main() -> int:
         notify_note = " · texted Alex" if (should_notify and notify_enabled and not args.raw) else (
             f" · WOULD text: {notify_text!r}" if should_notify else ""
         )
-        log(f"  ✓ → {note_path.relative_to(VAULT)}{flag_note}{notify_note}")
+        log(f"  ✓ → {note_ref}{flag_note}{notify_note}")
 
     return 0
 

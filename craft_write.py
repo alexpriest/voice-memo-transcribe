@@ -1,0 +1,191 @@
+"""Write a voice memo into a Craft daily note as a collapsible toggle.
+
+Structure produced (matches the format Alex specced):
+
+    ───────────────────────────────────                 (divider; keeps the memo
+    ▸ ### Voice memo: <title> · <time> · <duration>      from running into the
+         <transcript paragraph 1>                        rest of the daily note)
+         <transcript paragraph 2>
+         *Flagged: …*                                    (only if uncertainties)
+         🎵 <pretty-name>.m4a                             (nested, plays)
+
+Craft API facts (reverse-engineered — see craft-mirror/README.md):
+  * POST /blocks {blocks, position:{date|pageId|siblingId, position}} creates blocks.
+    Nesting is by `indentationLevel` (children = parent + 1). listStyle "toggle"
+    makes the collapsible header.
+  * A divider is `{type:"text", markdown:"---"}` — it comes back as `type:"line"`.
+    There is no `{type:"divider"}`; that 400s with a union-validation error.
+  * POST /upload?<position> with the RAW file bytes (Content-Type: audio/mp4) hosts
+    the audio and returns {blockId, assetUrl}. It cannot set a fileName or indent.
+  * To get a NAMED, NESTED audio block, upload for the bytes, then create a
+    `{type:file, url:<assetUrl>, fileName, indentationLevel}` block via /blocks and
+    delete the loose upload block.
+
+Creds come from the environment (CRAFT_BASE_URL / CRAFT_CREDENTIAL), a local .env,
+or `op` as a last resort — never `op` under launchd (it stalls on the desktop app).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+_ENV_FILE = Path(__file__).resolve().parent / ".env"
+
+
+class CraftError(Exception):
+    pass
+
+
+def _load_env_file():
+    if not _ENV_FILE.is_file():
+        return
+    for line in _ENV_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        line = line[len("export "):] if line.startswith("export ") else line
+        if "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip())
+
+
+def _op(field: str) -> str:
+    key = {"base_url": "CRAFT_BASE_URL", "credential": "CRAFT_CREDENTIAL"}[field]
+    if os.environ.get(key):
+        return os.environ[key].strip()
+    a = ["op", "item", "get", "Craft API", "--vault", "Claude", "--fields", f"label={field}"]
+    if field == "credential":
+        a.append("--reveal")
+    return subprocess.run(a, capture_output=True, text=True, check=True, timeout=20).stdout.strip()
+
+
+def creds() -> tuple[str, str]:
+    _load_env_file()
+    base = _op("base_url").rstrip("/")
+    cred = _op("credential")
+    if not base or not cred:
+        raise CraftError("missing Craft credentials (CRAFT_BASE_URL / CRAFT_CREDENTIAL)")
+    return base, cred
+
+
+def _req(method: str, url: str, cred: str, *, json_body=None, raw_body=None, content_type=None):
+    headers = {"Authorization": f"Bearer {cred}", "User-Agent": _UA}
+    data = None
+    if json_body is not None:
+        data = json.dumps(json_body).encode()
+        headers["Content-Type"] = "application/json"
+    elif raw_body is not None:
+        data = raw_body
+        headers["Content-Type"] = content_type or "application/octet-stream"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            body = r.read().decode("utf-8")
+            return json.loads(body) if body.strip() else {}
+    except urllib.error.HTTPError as e:
+        raise CraftError(f"{method} {url.split('?')[0]} -> {e.code}: {e.read().decode('utf-8','replace')[:200]}")
+
+
+# --------------------------------------------------------------------------- #
+
+def _blocks(base, cred, date):
+    """Fetch a daily note's block tree (top-level content list)."""
+    d = _req("GET", f"{base}/blocks?date={date}", cred)
+    return d.get("content", []) if isinstance(d, dict) else []
+
+
+def _find_existing_group(blocks, toggle_id) -> list[str]:
+    """Return block ids of a previously-written voice-memo group, for replacement.
+
+    Identity comes from the toggle's block id (recorded in the local ledger), NOT
+    from a marker in the visible text — Alex reads these notes and a stray
+    `^vm-1A2B3C4D` in the header is noise. The group is the toggle header, the run
+    of blocks indented beneath it, and the divider immediately preceding it.
+
+    Returns [] if the toggle is gone (he deleted or moved it) — we then just append
+    a fresh group rather than guessing at a match.
+    """
+    if not toggle_id:
+        return []
+    ids = []
+    n = len(blocks)
+    for i, b in enumerate(blocks):
+        if b.get("id") != toggle_id:
+            continue
+        if i and blocks[i - 1].get("type") == "line":
+            ids.append(blocks[i - 1]["id"])
+        ids.append(b["id"])
+        j = i + 1
+        while j < n and (blocks[j].get("indentationLevel") or 0) >= 1:
+            ids.append(blocks[j]["id"])
+            j += 1
+        break
+    return ids
+
+
+def write_voice_memo(*, date: str, title: str, time_label: str, duration_label: str,
+                     transcript: str, uncertainties, audio_path: str, pretty_name: str,
+                     shortid: str, prev_toggle_id: str | None = None) -> dict:
+    """Create (or replace) the voice-memo toggle on the given Craft daily note.
+
+    Pass `prev_toggle_id` (from the ledger) when reprocessing a memo so the old
+    group is replaced instead of duplicated.
+
+    Returns {"toggle_id", "audio_block_id"}.
+    """
+    base, cred = creds()
+
+    # Replace any prior group for this memo (idempotent reprocess).
+    old = _find_existing_group(_blocks(base, cred, date), prev_toggle_id)
+    if old:
+        _req("DELETE", f"{base}/blocks", cred, json_body={"blockIds": old})
+
+    # 1) divider, then toggle header + transcript paragraphs (+ flags) at indent 1.
+    #    The divider stops the memo from running into whatever Alex already wrote.
+    header = f"### Voice memo: {title} · {time_label} · {duration_label}"
+    blocks = [{"type": "text", "markdown": "---", "indentationLevel": 0},
+              {"type": "text", "markdown": header, "listStyle": "toggle", "indentationLevel": 0}]
+    paragraphs = [p.strip() for p in transcript.strip().split("\n\n") if p.strip()] or ["(no transcript)"]
+    for p in paragraphs:
+        blocks.append({"type": "text", "markdown": p, "indentationLevel": 1})
+    if uncertainties:
+        blocks.append({"type": "text",
+                       "markdown": f"*Flagged: {'; '.join(uncertainties)}*",
+                       "indentationLevel": 1})
+    created = _req("POST", f"{base}/blocks", cred,
+                   json_body={"blocks": blocks, "position": {"date": date, "position": "end"}})
+    items = created.get("items", [])
+    if len(items) < 2:
+        raise CraftError(f"expected divider + toggle, got {len(items)} block(s)")
+    toggle_id = items[1]["id"]  # items[0] is the divider
+    last_text_id = items[-1]["id"]
+
+    # 2) upload the audio bytes (loose block), then re-attach as a named, nested
+    #    file block after the transcript, and delete the loose upload block.
+    audio_bytes = Path(audio_path).read_bytes()
+    up = _req("POST", f"{base}/upload?siblingId={last_text_id}&position=after",
+              cred, raw_body=audio_bytes, content_type="audio/mp4")
+    asset_url = up.get("assetUrl")
+    loose_id = up.get("blockId")
+    if not asset_url:
+        raise CraftError(f"upload returned no assetUrl: {up}")
+    file_block = _req("POST", f"{base}/blocks", cred, json_body={
+        "blocks": [{"type": "file", "url": asset_url, "fileName": pretty_name,
+                    "markdown": f"[{pretty_name}]({asset_url})", "indentationLevel": 1}],
+        "position": {"siblingId": last_text_id, "position": "after"},
+    })
+    audio_block_id = file_block.get("items", [{}])[0].get("id")
+    if loose_id:
+        try:
+            _req("DELETE", f"{base}/blocks", cred, json_body={"blockIds": [loose_id]})
+        except CraftError:
+            pass  # a lingering loose block is cosmetic, not worth failing the memo
+
+    return {"toggle_id": toggle_id, "audio_block_id": audio_block_id}
