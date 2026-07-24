@@ -47,6 +47,7 @@ TOOL_DIR = Path(__file__).resolve().parent
 LEDGER_PATH = TOOL_DIR / "state" / "processed.json"
 LOCK_PATH = TOOL_DIR / "state" / ".lock"
 RENAME_NOTIFY_PATH = TOOL_DIR / "state" / "rename_notify.json"  # backlog-nudge dedupe state
+FATAL_NOTIFY_PATH = TOOL_DIR / "state" / "fatal_notify.json"  # outage-nudge dedupe state
 CALLGUARD_BIN = TOOL_DIR / "bin" / "callguard"  # camera/mic-in-use probe (see bin/callguard.swift)
 SETTLE_SECONDS = 25  # let recording / iCloud writes finish before reading the container
 AUDIO_DEST = VAULT / "System" / "Voice Memos" / "Audio"
@@ -909,6 +910,65 @@ def append_activity(memo: dict, flags: list[str], title: str) -> None:
 
 
 # ---------------------------------------------------------------------------- #
+# Failure guard
+# ---------------------------------------------------------------------------- #
+def fatal_message(exc: BaseException) -> str:
+    """Plain-text SMS for a run-killing error. Names the fix, not just the symptom."""
+    if isinstance(exc, PermissionError):
+        return (
+            "Voice memo transcription is DOWN: no Full Disk Access, so it can't read the "
+            "Voice Memos database. Fix: System Settings > Privacy & Security > Full Disk "
+            f"Access, re-grant {TOOL_DIR}/.venv/bin/python3.11. "
+            "Memos are queued and process once it's back."
+        )[:315]
+    detail = str(exc)[:120].strip().rstrip(".")
+    return (
+        f"Voice memo transcription is DOWN: {type(exc).__name__}: {detail}. "
+        "Nothing is being transcribed. Log: ~/Library/Logs/voice-memo-transcribe.log"
+    )[:315]
+
+
+def notify_fatal(exc: BaseException) -> None:
+    """Text Alex when a run dies outright — ONCE per outage. This job fires on every
+    filesystem event in the Recordings dir, so an un-deduped nudge would text him dozens of
+    times. Dedupe is keyed on the error signature and cleared by the next successful DB read
+    (clear_fatal_notify), so a later outage nudges again. Fails open: a problem in here must
+    never become a second failure mode or mask the real one."""
+    try:
+        signature = f"{type(exc).__name__}: {str(exc)[:200]}"
+        state = {}
+        if FATAL_NOTIFY_PATH.exists():
+            try:
+                state = json.loads(FATAL_NOTIFY_PATH.read_text())
+            except (ValueError, OSError):
+                state = {}
+        if state.get("signature") == signature:
+            log("fatal: already nudged for this outage — staying quiet")
+            return
+        body = fatal_message(exc)
+        if "--no-notify" in sys.argv or "--dry-run" in sys.argv:
+            log(f"fatal: WOULD text: {body!r}")
+            return
+        if not _send_sms(body):
+            return
+        FATAL_NOTIFY_PATH.write_text(json.dumps(
+            {"signature": signature,
+             "last_notified": datetime.now().isoformat(timespec="seconds")}, indent=2))
+        log("fatal: nudged Alex")
+    except Exception as e:  # noqa: BLE001 - the guard must never mask the real failure
+        log(f"fatal: could not notify: {e}")
+
+
+def clear_fatal_notify() -> None:
+    """A successful DB read means the outage is over — drop the dedupe state so the next one
+    nudges. Fails open for the same reason as notify_fatal."""
+    try:
+        FATAL_NOTIFY_PATH.unlink(missing_ok=True)
+    except OSError as e:
+        log(f"fatal: could not clear notify state: {e}")
+
+
+# ---------------------------------------------------------------------------- #
 # Main
 # ---------------------------------------------------------------------------- #
 def select_memos(memos: list[dict], ledger: dict, args) -> list[dict]:
@@ -967,6 +1027,7 @@ def main() -> int:
 
     ledger = load_ledger()
     memos = query_memos()
+    clear_fatal_notify()  # DB read worked — any prior outage is over
     log(f"{len(memos)} eligible memos in DB")
 
     if args.seed_ledger:
@@ -1079,4 +1140,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        rc = main()
+    except Exception as e:  # noqa: BLE001 - nudge Alex, then die loudly into the log as before
+        notify_fatal(e)
+        raise
+    sys.exit(rc)

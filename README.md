@@ -66,6 +66,13 @@ tool). System Settings → Privacy & Security:
 - **Accessibility** — to DRIVE the Voice Memos rename UI. Without it the rename runner can't
   control the app.
 
+**Outage nudge.** A grant can be revoked silently (it happened 2026-07-23 — seven runs died into
+the log unread while a memo sat untranscribed for over an hour). Any run-killing exception now
+texts Alex naming the fix, then still dies loudly into the log. Deduped **once per outage** —
+this job fires on every filesystem event, so the signature is stored in `state/fatal_notify.json`
+and cleared by the next successful DB read, meaning a later outage nudges again. The guard fails
+open: a broken notifier logs and gets out of the way rather than becoming a second failure mode.
+
 ## Install (after build)
 
 ```sh
