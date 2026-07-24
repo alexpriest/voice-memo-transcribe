@@ -843,8 +843,15 @@ def rename_queue(args) -> int:
         return 0
 
     ledger = load_ledger()
-    pending = [uid for uid, e in ledger.items()
-               if e.get("status") == "done" and not e.get("app_renamed")]
+    # "titled" = named by --retitle-all (title only, no note written); "done" = fully
+    # processed. Both have a title to apply, so both belong in the rename queue.
+    # Oldest first, so when two memos share a name the older one is renamed first and
+    # the collision clears itself instead of blocking both.
+    pending = sorted(
+        (uid for uid, e in ledger.items()
+         if e.get("status") in ("done", "titled") and e.get("title") and not e.get("app_renamed")),
+        key=lambda u: ledger[u].get("recorded") or "",
+    )
 
     if not args.force:
         if screen_locked():
@@ -1026,6 +1033,26 @@ def notify_fatal(exc: BaseException) -> None:
 
 SHORT_MEMO_TITLE = "Short recording"
 
+# Whisper hallucinates plausible-length gibberish out of silence, so a length check alone
+# doesn't catch empty memos — the enricher dutifully writes a title ABOUT the audio quality
+# ("Memo too garbled to recover"). Those are useless for finding a memo later; the name iOS
+# gave it is a LOCATION and strictly more useful. Detect and fall back.
+META_TITLE_RE = re.compile(
+    r"garbl|unintelligib|inaudib|indecipher|silence|silent|no speech|nothing but|"
+    r"nothing to (say|transcribe|recover|report)|no content|empty|blank|"
+    r"too (short|quiet|garbled)|couldn'?t|could not|unclear audio|no audible",
+    re.I,
+)
+
+
+def usable_title(generated: str, orig_title: str) -> str:
+    """A title that describes the *recording* instead of its content is worse than useless."""
+    if generated and not META_TITLE_RE.search(generated):
+        return generated
+    if orig_title and not orig_title.startswith("New Recording"):
+        return orig_title  # iOS location name — at least says where he was
+    return SHORT_MEMO_TITLE
+
 
 def retitle_all(args) -> int:
     """Give every un-dated memo in the app a title, then let --rename-queue apply them.
@@ -1076,12 +1103,28 @@ def retitle_all(args) -> int:
             except Exception as e:  # noqa: BLE001 - one bad memo must not kill the pass
                 log(f"  transcribe error: {e} — leaving untitled")
                 continue
-            enriched = None if args.raw else enrich(m, tr, "", notify_enabled=False)
-            title = ((enriched or {}).get("title") or "").strip()
+            spoken = (tr.get("text") or "").strip()
+            if len(spoken) < 40:
+                # Silence or a pocket-recording. A generated title here just describes the
+                # emptiness ("Nearly empty memo, barely a word"), which is less useful than
+                # the name iOS already gave it -- those are LOCATIONS ("Beaver Creek
+                # Resort", "Deer Ridge Cir"), so they at least say where he was.
+                title = m["title"]
+                if title.startswith("New Recording"):
+                    title = SHORT_MEMO_TITLE  # generic name + no speech = nothing to preserve
+                log(f"  no real speech ({len(spoken)} chars) — keeping {title!r}")
+                enriched = None
+            else:
+                enriched = None if args.raw else enrich(m, tr, "", notify_enabled=False)
+                title = ((enriched or {}).get("title") or "").strip()
             if not title:
                 # No enrichment: fall back to the transcript's opening words, which still
                 # beats "New Recording 4" for finding a memo later.
                 title = " ".join((tr.get("text") or "").split()[:8]).strip(" .,") or m["title"]
+            before = title
+            title = usable_title(title, entry.get("orig_title") or m["title"])
+            if title != before:
+                log(f"  {before!r} describes the audio, not the content — using {title!r}")
             log(f"  title: {title!r}")
         if args.dry_run:
             continue
