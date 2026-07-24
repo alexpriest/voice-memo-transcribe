@@ -613,6 +613,7 @@ def _as_escape(s: str) -> str:
 # press Escape and abort. Worst case is "didn't rename" — it can NEVER rename the wrong memo.
 RENAME_APPLESCRIPT = '''
 set expected to "{cur}"
+set expectedDur to "{dur}"
 set newTitle to "{new}"
 set savedClip to ""
 try
@@ -632,20 +633,55 @@ tell application "System Events"
         set the clipboard to savedClip
         return "NOWINDOW"
     end try
-    set target to missing value
+    set matches to {{}}
     repeat with el in ec
         if (role of el) is "AXTextField" then
             try
                 if (value of el) is expected then
-                    set target to el
-                    exit repeat
+                    set end of matches to el
                 end if
             end try
         end if
     end repeat
-    if target is missing value then
+    if (count of matches) is 0 then
         set the clipboard to savedClip
         return "NOFIELD"
+    end if
+    set target to missing value
+    if (count of matches) is 1 then
+        set target to item 1 of matches
+    else
+        -- Duplicate titles (Voice Memos happily makes two "New Recording 6"). Neither can
+        -- be isolated by title, so disambiguate on the duration label in the same row --
+        -- digits, so no locale/date-format guessing. If that still doesn't resolve to
+        -- exactly one row we abort rather than guess at which memo is ours.
+        set hits to {{}}
+        repeat with el in matches
+            set rp to el
+            repeat with i from 1 to 5
+                try
+                    set rp to value of attribute "AXParent" of rp
+                on error
+                    exit repeat
+                end try
+                if (role of rp) is "AXButton" then exit repeat
+            end repeat
+            try
+                repeat with sub in (entire contents of rp)
+                    if (role of sub) is "AXStaticText" then
+                        if (value of sub) is expectedDur then
+                            set end of hits to el
+                            exit repeat
+                        end if
+                    end if
+                end repeat
+            end try
+        end repeat
+        if (count of hits) is 1 then set target to item 1 of hits
+    end if
+    if target is missing value then
+        set the clipboard to savedClip
+        return "AMBIGUOUS"
     end if
     -- The row container is an AXButton; pressing the text field itself does NOT move
     -- selection (File>Rename would then act on whatever was already selected).
@@ -701,11 +737,26 @@ end tell
 '''
 
 
-def gui_rename(current_title: str, new_title: str) -> str:
+def ui_duration(seconds: float) -> str:
+    """Duration as Voice Memos renders it in the list ("0:01", "12:13", "1:02:03").
+
+    Used only to tell duplicate-titled rows apart. Voice Memos rounds to the nearest
+    second; if this string doesn't match, the AppleScript returns AMBIGUOUS and we skip
+    rather than rename the wrong memo -- a miss here is safe, never destructive.
+    """
+    total = int(round(seconds))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def gui_rename(current_title: str, new_title: str, duration: float = 0.0) -> str:
     """Rename a recording via the real Voice Memos File>Rename UI, gated on verifying the
     edit box holds the expected current title before typing. Returns
-    DONE | WRONGSEL | NOFIELD | NOWINDOW | ERR:<msg>. Caller also verifies against the DB."""
-    script = RENAME_APPLESCRIPT.format(cur=_as_escape(current_title), new=_as_escape(new_title))
+    DONE | WRONGSEL | AMBIGUOUS | NOFIELD | NOWINDOW | ERR:<msg>. Caller also verifies
+    against the DB."""
+    script = RENAME_APPLESCRIPT.format(cur=_as_escape(current_title), new=_as_escape(new_title),
+                                       dur=_as_escape(ui_duration(duration)))
     try:
         proc = subprocess.run(["osascript", "-"], input=script,
                               capture_output=True, text=True, timeout=30)
@@ -836,17 +887,20 @@ def rename_queue(args) -> int:
             if current == new_title:
                 entry["app_renamed"] = True
                 continue
-            # The AX pass targets the FIRST row matching the title (topmost = newest).
-            # If another memo shares this title and ours isn't the newest, that first
-            # match would be the wrong memo — skip and flag for manual handling.
+            # Duplicate titles used to be unrenameable: matching by title alone can't tell
+            # two "New Recording 6" rows apart, so BOTH stalled forever. gui_rename now
+            # disambiguates on the row's duration label; we just log it so a stall is
+            # visible in the log rather than looking like a mystery WRONGSEL.
+            dur = next((m["duration"] for m in all_memos if m["uid"] == uid), 0.0)
             same_title = [m for m in all_memos if m["title"] == current]
             if len(same_title) > 1:
-                newest = max(same_title, key=lambda m: m["recorded"])
-                if newest["uid"] != uid:
-                    log(f"rename: {uid[:8]} title {current!r} duplicated in app and target "
-                        f"isn't the newest — skipping (retitle the other memo to unblock)")
-                    continue
-            result = gui_rename(current, new_title)
+                log(f"rename: {uid[:8]} title {current!r} is shared by {len(same_title)} memos "
+                    f"— disambiguating on duration {ui_duration(dur)}")
+            result = gui_rename(current, new_title, dur)
+            if result == "AMBIGUOUS":
+                log(f"rename: {uid[:8]} title {current!r} duplicated and duration "
+                    f"{ui_duration(dur)} didn't isolate a row — skipped safely, not renamed")
+                continue
             if result == "NOWINDOW":
                 log("rename: no Voice Memos window — aborting pass")
                 break
@@ -970,6 +1024,81 @@ def notify_fatal(exc: BaseException) -> None:
         log(f"fatal: could not notify: {e}")
 
 
+SHORT_MEMO_TITLE = "Short recording"
+
+
+def retitle_all(args) -> int:
+    """Give every un-dated memo in the app a title, then let --rename-queue apply them.
+
+    Deliberately does NOT write to Craft or Obsidian. Alex asked for his back catalogue
+    to be *named*, not for five years of old audio to be backfilled into daily notes that
+    never existed. The transcript is generated, used to pick a title, and dropped.
+
+    Memos below MIN_DURATION_S (accidental taps) can't be transcribed, so they get a
+    dated placeholder rather than being skipped — leaving them untitled is what let two
+    "New Recording 6"s collide and stall the rename runner indefinitely.
+    """
+    ledger = load_ledger()
+    memos = query_memos(min_duration=0.0)  # include the sub-3s taps
+    clear_fatal_notify()
+    todo = [m for m in memos if not m["title"][:4].isdigit()]  # already "YYYY-MM-DD — ..." = done
+    if args.limit:
+        todo = todo[: args.limit]
+    log(f"{len(memos)} memos in app, {len(todo)} without a dated title")
+
+    # Two taps on the same day would both become "<date> — Short recording", i.e. a brand
+    # new duplicate-title collision of exactly the kind this pass exists to clear. Number
+    # the repeats so every produced title is unique.
+    short_seen: dict[str, int] = {}
+
+    done = 0
+    for m in todo:
+        entry = dict(ledger.get(m["uid"]) or {})
+        if m["duration"] < MIN_DURATION_S:
+            day = f"{m['recorded']:%Y-%m-%d}"
+            short_seen[day] = short_seen.get(day, 0) + 1
+            n = short_seen[day]
+            title = SHORT_MEMO_TITLE if n == 1 else f"{SHORT_MEMO_TITLE} {n}"
+            log(f"→ {day} {m['title']!r} ({m['duration']:.1f}s) "
+                f"— too short to transcribe, titling {title!r}")
+        elif entry.get("title") and entry.get("status") in ("done", "titled"):
+            # Already transcribed on a previous run (e.g. today's memo, which is written to
+            # Craft already) — reuse that title instead of burning the transcription again.
+            title = entry["title"]
+            log(f"→ {m['recorded']:%Y-%m-%d} {m['title']!r} — already titled {title!r}, reusing")
+        else:
+            log(f"→ {m['recorded']:%Y-%m-%d} {m['title']!r} ({fmt_duration(m['duration'])})")
+            if args.dry_run:
+                log("  [dry-run] would transcribe for a title")
+                continue
+            try:
+                tr = transcribe(m["audio"])
+            except Exception as e:  # noqa: BLE001 - one bad memo must not kill the pass
+                log(f"  transcribe error: {e} — leaving untitled")
+                continue
+            enriched = None if args.raw else enrich(m, tr, "", notify_enabled=False)
+            title = ((enriched or {}).get("title") or "").strip()
+            if not title:
+                # No enrichment: fall back to the transcript's opening words, which still
+                # beats "New Recording 4" for finding a memo later.
+                title = " ".join((tr.get("text") or "").split()[:8]).strip(" .,") or m["title"]
+            log(f"  title: {title!r}")
+        if args.dry_run:
+            continue
+        entry.update({"status": entry.get("status") or "titled",
+                      "recorded": m["recorded"].isoformat(timespec="seconds"),
+                      "orig_title": entry.get("orig_title") or m["title"],
+                      "title": title,
+                      "app_renamed": False,
+                      "titled_at": datetime.now().isoformat(timespec="seconds")})
+        ledger[m["uid"]] = entry
+        save_ledger(ledger)
+        done += 1
+
+    log(f"titled {done} memo(s) — run --rename-queue to apply them in the app")
+    return 0
+
+
 def clear_fatal_notify() -> None:
     """A successful DB read means the outage is over — drop the dedupe state so the next one
     nudges. Fails open for the same reason as notify_fatal."""
@@ -1020,7 +1149,13 @@ def main() -> int:
                     help="drain the app-rename backlog via GUI (gated on unlock + idle)")
     ap.add_argument("--force", action="store_true",
                     help="with --rename-queue: bypass the unlock/idle gate (manual test)")
+    ap.add_argument("--retitle-all", action="store_true",
+                    help="give every un-dated memo in the app a title and queue the rename; "
+                         "transcribes ONLY to pick a title — writes nothing to Craft/Obsidian")
     args = ap.parse_args()
+
+    if args.retitle_all:
+        return retitle_all(args)
 
     if args.rename_queue:
         return rename_queue(args)
