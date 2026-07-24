@@ -165,6 +165,9 @@ def query_memos(min_duration: float = MIN_DURATION_S) -> list[dict]:
             FROM ZCLOUDRECORDING
             WHERE (ZPATH LIKE '%.m4a' OR ZPATH LIKE '%.qta')
               AND ZDURATION >= ?
+              -- Rows in Recently Deleted still sit in this table. They have no row in the
+              -- app's list, so a rename can never land and the runner retries them forever.
+              AND ZEVICTIONDATE IS NULL
             ORDER BY ZDATE ASC
             """,
             (min_duration,),
@@ -633,93 +636,68 @@ tell application "System Events"
         set the clipboard to savedClip
         return "NOWINDOW"
     end try
-    set matches to {{}}
-    repeat with el in ec
-        if (role of el) is "AXTextField" then
-            try
-                if (value of el) is expected then
-                    set end of matches to el
-                end if
-            end try
-        end if
-    end repeat
-    if (count of matches) is 0 then
-        set the clipboard to savedClip
-        return "NOFIELD"
-    end if
-    set target to missing value
-    if (count of matches) is 1 then
-        set target to item 1 of matches
-    else
-        -- Duplicate titles (Voice Memos happily makes two "New Recording 6"). Neither can
-        -- be isolated by title, so disambiguate on the duration label in the same row --
-        -- digits, so no locale/date-format guessing. If that still doesn't resolve to
-        -- exactly one row we abort rather than guess at which memo is ours.
-        set hits to {{}}
-        repeat with el in matches
-            set rp to el
-            repeat with i from 1 to 5
-                try
-                    set rp to value of attribute "AXParent" of rp
-                on error
-                    exit repeat
-                end try
-                if (role of rp) is "AXButton" then exit repeat
-            end repeat
-            try
-                repeat with sub in (entire contents of rp)
-                    if (role of sub) is "AXStaticText" then
-                        if (value of sub) is expectedDur then
-                            set end of hits to el
-                            exit repeat
-                        end if
-                    end if
-                end repeat
-            end try
-        end repeat
-        if (count of hits) is 1 then set target to item 1 of hits
-    end if
-    if target is missing value then
-        set the clipboard to savedClip
-        return "AMBIGUOUS"
-    end if
-    -- The row container is an AXButton; pressing the text field itself does NOT move
-    -- selection (File>Rename would then act on whatever was already selected).
-    -- Walk up to the row button and select/press that instead.
+    -- Find the ROW, not a text field. There is no title editor for an unselected row --
+    -- the whole window holds exactly two AXTextFields (the search box and one parked 0x0
+    -- field), and the editor is only vended once a row is selected. Searching for the
+    -- field first could therefore only ever succeed on the already-selected memo, which
+    -- is why newly-recorded memos renamed fine and every backfill failed.
+    -- A row is an AXButton whose AXDescription is "<title>, <time>".
     set rowBtn to missing value
-    set cur to target
-    repeat with i from 1 to 5
-        set p to value of attribute "AXParent" of cur
-        if (role of p) is "AXButton" then
-            set rowBtn to p
-            exit repeat
-        end if
-        set cur to p
+    set rowHits to 0
+    repeat with el in ec
+        try
+            if (role of el) is "AXButton" then
+                set dsc to (value of attribute "AXDescription" of el) as text
+                if dsc is expected or dsc starts with (expected & ", ") then
+                    set rowHits to rowHits + 1
+                    if rowBtn is missing value then set rowBtn to el
+                end if
+            end if
+        end try
     end repeat
     if rowBtn is missing value then
         set the clipboard to savedClip
-        return "NOROW"
+        return "NOFIELD"
     end if
+    if rowHits > 1 then
+        set the clipboard to savedClip
+        return "AMBIGUOUS"
+    end if
+
+    -- Drag it into view before pressing: an unrendered row can't be selected.
+    try
+        perform action "AXScrollToVisible" of rowBtn
+        delay 0.3
+    end try
     try
         set value of attribute "AXSelected" of rowBtn to true
     on error
         perform action "AXPress" of rowBtn
     end try
-    delay 0.4
+    delay 0.5
+
+    -- Selecting a row does NOT vend the title editor -- it appears only once the app is
+    -- actually in rename mode. Scanning for it here fails on every memo (the NOSEL runs),
+    -- so go straight to File>Rename and gate on the re-scan below.
     try
         click menu item "Rename…" of menu "File" of menu bar 1 of proc
     end try
-    delay 0.5
-    -- Gate on the EXACT element we matched: after Rename opens, the target text field
-    -- itself must report AXFocused=true and still hold the expected title. (The
-    -- process-level AXFocusedUIElement misreports as the row button — do not use it.)
-    -- If some other row entered edit mode, our field reads focused=false -> abort.
+    delay 0.6
+    -- Re-scan AFTER Rename opens. Entering edit mode re-vends the field, so the handle
+    -- from before the menu click is stale -- reusing it is what produced the 73 WRONGSEL
+    -- aborts, including on row 0 where nothing was ambiguous or off-screen.
+    -- The process-level AXFocusedUIElement misreports as the row button; don't use it.
     set gateOK to false
-    try
-        if ((value of attribute "AXFocused" of target) is true) and ((value of target) is expected) then
-            set gateOK to true
-        end if
-    end try
+    repeat with el in (entire contents of window 1 of proc)
+        try
+            if (role of el) is "AXTextField" then
+                if ((value of attribute "AXSubrole" of el) is not "AXSearchField") and ((value of attribute "AXFocused" of el) is true) and ((value of el) is expected) then
+                    set gateOK to true
+                    exit repeat
+                end if
+            end if
+        end try
+    end repeat
     if not gateOK then
         key code 53
         set the clipboard to savedClip
