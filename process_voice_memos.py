@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -85,11 +86,12 @@ INNER_CIRCLE = [
      "who": "AJ's wife, family friend (default for 'Ash' unless context clearly means a work 'Ash')"},
 ]
 
-# App rename runner (--rename-queue): drives the real Voice Memos File>Rename UI so the
-# rename syncs via CloudKit. Only fires when the screen is unlocked and the user has been
-# idle (so it never grabs the cursor mid-use). Needs Full Disk Access AND Accessibility.
+# App rename runner (--rename-queue): applies queued titles by writing THROUGH Core Data via
+# the vmrename helper, so Core Data logs a history transaction and voicememod exports it to
+# iCloud. No UI, no stolen focus, no idle/unlock gating. Needs Full Disk Access. See
+# bin/vmrename.swift and craft-mirror-style notes in README.
 RENAME_LOCK_PATH = TOOL_DIR / "state" / ".rename.lock"
-IDLE_THRESHOLD_S = 120  # user must be idle this long before we touch the UI
+VMRENAME_BIN = TOOL_DIR / "bin" / "vmrename"
 
 # Whisper segment confidence thresholds -> "shaky" span
 LOW_AVG_LOGPROB = -1.0
@@ -583,176 +585,6 @@ def on_call() -> tuple[bool, str]:
     return False, out
 
 
-def screen_locked() -> bool:
-    """True if the screen is locked (or state can't be read — fail safe)."""
-    try:
-        import Quartz
-        d = Quartz.CGSessionCopyCurrentDictionary()
-        if not d:
-            return True
-        return bool(d.get("CGSSessionScreenIsLocked", 0))
-    except Exception:  # noqa: BLE001
-        return True
-
-
-def idle_seconds() -> float:
-    """Seconds since the last keyboard/mouse input."""
-    try:
-        import Quartz
-        return Quartz.CGEventSourceSecondsSinceLastEventType(
-            Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType
-        )
-    except Exception:  # noqa: BLE001
-        return 0.0
-
-
-def _as_escape(s: str) -> str:
-    return s.replace("\\", "\\\\").replace('"', '\\"')
-
-
-# Rename via the real File>Rename UI, with a hard safety gate: after opening Rename we read
-# the title that is actually in the edit box (the AXFocusedUIElement) and confirm it equals the
-# memo we intend to rename. If it doesn't match (wrong row selected, virtualized list, etc.) we
-# press Escape and abort. Worst case is "didn't rename" — it can NEVER rename the wrong memo.
-RENAME_APPLESCRIPT = '''
-set expected to "{cur}"
-set expectedDur to "{dur}"
-set newTitle to "{new}"
-set savedClip to ""
-try
-    set savedClip to the clipboard
-end try
-set the clipboard to newTitle
-tell application "VoiceMemos"
-    reopen
-    activate
-end tell
-delay 1.2
-tell application "System Events"
-    set proc to process "VoiceMemos"
-    try
-        set ec to entire contents of window 1 of proc
-    on error
-        set the clipboard to savedClip
-        return "NOWINDOW"
-    end try
-    -- Find the ROW, not a text field. There is no title editor for an unselected row --
-    -- the whole window holds exactly two AXTextFields (the search box and one parked 0x0
-    -- field), and the editor is only vended once a row is selected. Searching for the
-    -- field first could therefore only ever succeed on the already-selected memo, which
-    -- is why newly-recorded memos renamed fine and every backfill failed.
-    -- A row is an AXButton whose AXDescription is "<title>, <time>".
-    set rowBtn to missing value
-    set rowHits to 0
-    repeat with el in ec
-        try
-            if (role of el) is "AXButton" then
-                set dsc to (value of attribute "AXDescription" of el) as text
-                if dsc is expected or dsc starts with (expected & ", ") then
-                    set rowHits to rowHits + 1
-                    if rowBtn is missing value then set rowBtn to el
-                end if
-            end if
-        end try
-    end repeat
-    if rowBtn is missing value then
-        set the clipboard to savedClip
-        return "NOFIELD"
-    end if
-    if rowHits > 1 then
-        set the clipboard to savedClip
-        return "AMBIGUOUS"
-    end if
-
-    -- Drag it into view before pressing: an unrendered row can't be selected.
-    try
-        perform action "AXScrollToVisible" of rowBtn
-        delay 0.3
-    end try
-    try
-        set value of attribute "AXSelected" of rowBtn to true
-    on error
-        perform action "AXPress" of rowBtn
-    end try
-    delay 0.5
-
-    -- Selecting a row does NOT vend the title editor -- it appears only once the app is
-    -- actually in rename mode. Scanning for it here fails on every memo (the NOSEL runs),
-    -- so go straight to File>Rename and gate on the re-scan below.
-    try
-        click menu item "Rename…" of menu "File" of menu bar 1 of proc
-    end try
-    delay 0.6
-    -- Re-scan AFTER Rename opens. Entering edit mode re-vends the field, so the handle
-    -- from before the menu click is stale -- reusing it is what produced the 73 WRONGSEL
-    -- aborts, including on row 0 where nothing was ambiguous or off-screen.
-    -- The process-level AXFocusedUIElement misreports as the row button; don't use it.
-    set gateOK to false
-    repeat with el in (entire contents of window 1 of proc)
-        try
-            if (role of el) is "AXTextField" then
-                if ((value of attribute "AXSubrole" of el) is not "AXSearchField") and ((value of attribute "AXFocused" of el) is true) and ((value of el) is expected) then
-                    set gateOK to true
-                    exit repeat
-                end if
-            end if
-        end try
-    end repeat
-    if not gateOK then
-        key code 53
-        set the clipboard to savedClip
-        return "WRONGSEL"
-    end if
-    keystroke "a" using command down
-    delay 0.15
-    keystroke "v" using command down
-    delay 0.3
-    key code 36
-    delay 0.5
-    set the clipboard to savedClip
-    return "DONE"
-end tell
-'''
-
-
-def ui_duration(seconds: float) -> str:
-    """Duration as Voice Memos renders it in the list ("0:01", "12:13", "1:02:03").
-
-    Used only to tell duplicate-titled rows apart. Voice Memos rounds to the nearest
-    second; if this string doesn't match, the AppleScript returns AMBIGUOUS and we skip
-    rather than rename the wrong memo -- a miss here is safe, never destructive.
-    """
-    total = int(round(seconds))
-    h, rem = divmod(total, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-
-
-def gui_rename(current_title: str, new_title: str, duration: float = 0.0) -> str:
-    """Rename a recording via the real Voice Memos File>Rename UI, gated on verifying the
-    edit box holds the expected current title before typing. Returns
-    DONE | WRONGSEL | AMBIGUOUS | NOFIELD | NOWINDOW | ERR:<msg>. Caller also verifies
-    against the DB."""
-    script = RENAME_APPLESCRIPT.format(cur=_as_escape(current_title), new=_as_escape(new_title),
-                                       dur=_as_escape(ui_duration(duration)))
-    try:
-        proc = subprocess.run(["osascript", "-"], input=script,
-                              capture_output=True, text=True, timeout=30)
-    except (subprocess.TimeoutExpired, OSError) as e:
-        return f"ERR:{e}"
-    if proc.returncode != 0:
-        return f"ERR:{proc.stderr.strip()[:120]}"
-    return proc.stdout.strip()
-
-
-def db_titles_by_uid() -> dict:
-    """uid -> current display title (ZENCRYPTEDTITLE) from the live DB."""
-    out = {}
-    for m in query_memos():
-        out[m["uid"]] = m["title"]
-    return out
-
-
 def _send_sms(text: str) -> bool:
     """Send a plain-text iMessage to Alex via the vault's kit-tools MCP — the same path
     enrich() uses to notify. Returns True on success."""
@@ -774,163 +606,102 @@ def _send_sms(text: str) -> bool:
     return True
 
 
-def maybe_notify_backlog(pending: list[str], ledger: dict) -> None:
-    """When the rename runner is gated (screen locked / on a call / user active) but memos
-    are waiting, text Alex — ONCE per new memo. Fires only when the pending SET grows (a new
-    unrenamed memo appeared), so a genuinely-stuck item nudges once and never nags. Keeps a
-    stuck rename queue surfacing in hours, not days."""
-    if not pending:
-        return
-    state = {}
-    if RENAME_NOTIFY_PATH.exists():
-        try:
-            state = json.loads(RENAME_NOTIFY_PATH.read_text())
-        except (ValueError, OSError):
-            state = {}
-    notified = set(state.get("notified_uids", []))
-    if all(uid in notified for uid in pending):
-        return  # same (or smaller) backlog — he already knows, stay quiet
-    lines = []
-    for uid in pending:
-        e = ledger.get(uid, {})
-        day = (e.get("recorded") or "")[:10] or "?"
-        lines.append(f'{day} "{e.get("title") or "untitled"}"')
-    n = len(pending)
-    body = (
-        f"Voice Memos rename queue stuck: {n} memo{'s' if n != 1 else ''} waiting "
-        f"(Mac screen locked or in use, so the auto-rename can't run). "
-        + "; ".join(lines)
-        + ". Unlock + step away from the Mini for 2 min, or tell Kit to force-drain."
-    )[:315]
-    if _send_sms(body):
-        try:
-            RENAME_NOTIFY_PATH.write_text(json.dumps(
-                {"notified_uids": pending,
-                 "last_notified": datetime.now().isoformat(timespec="seconds")}, indent=2))
-        except OSError as e:
-            log(f"rename: could not persist notify state: {e}")
-        log(f"rename: nudged Alex — {n} memo(s) pending")
+def extract_model() -> Path:
+    """Dump Voice Memos' Core Data model out of the live store, fresh, every run.
+
+    Writing THROUGH this model (see bin/vmrename.swift) makes Core Data emit the
+    persistent-history transaction that the CloudKit mirroring delegate exports — so a
+    rename reaches the iPhone. A raw SQL UPDATE writes no history and never syncs.
+
+    Never cache the .mom: if it drifts from the live store, opening with it would trigger
+    a migration that drops columns. The Swift side hard-gates on compatibility, but
+    re-extracting each run keeps them in lockstep so the gate never even trips.
+    """
+    mc = TOOL_DIR / "state" / "model_cache.bin"
+    mom = TOOL_DIR / "state" / "VMModel.mom"
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "src.db"
+        shutil.copy2(DB_PATH, db)
+        con = sqlite3.connect(db)
+        blob = con.execute("SELECT Z_CONTENT FROM Z_MODELCACHE").fetchone()[0]
+        con.close()
+    mc.write_bytes(blob)
+    mom.write_bytes(zlib.decompress(blob, -15))
+    return mom
 
 
 def rename_queue(args) -> int:
-    """Drain the app-rename backlog via GUI automation — only when it's safe to touch
-    the UI (unlocked + user idle). Each success syncs to all devices via CloudKit."""
+    """Apply queued titles by writing THROUGH Core Data — no UI, no stolen focus.
+
+    Replaced the old File>Rename accessibility automation (2026-07-23). The Core Data
+    write is what a real rename does under the hood: Core Data logs a history transaction
+    and voicememod exports it to iCloud. Because nothing touches the screen, all the old
+    unlock/idle/on-call gating is gone — this can run headless any time.
+    """
     lock = acquire_lock(RENAME_LOCK_PATH)
     if lock is None:
         log("rename: another pass in progress")
         return 0
 
     ledger = load_ledger()
-    # "titled" = named by --retitle-all (title only, no note written); "done" = fully
-    # processed. Both have a title to apply, so both belong in the rename queue.
-    # Oldest first, so when two memos share a name the older one is renamed first and
-    # the collision clears itself instead of blocking both.
+    live = {m["uid"]: m["title"] for m in query_memos(min_duration=0.0)}  # excludes Recently Deleted
+    # Gate on app_renamed + a title, NOT on status: --retitle-all preserves a memo's prior
+    # status (e.g. "seeded"), so a status filter would wrongly skip named memos.
     pending = sorted(
-        (uid for uid, e in ledger.items()
-         if e.get("status") in ("done", "titled") and e.get("title") and not e.get("app_renamed")),
+        (uid for uid, e in ledger.items() if e.get("title") and not e.get("app_renamed")),
         key=lambda u: ledger[u].get("recorded") or "",
     )
 
-    if not args.force:
-        if screen_locked():
-            log("rename: screen locked — skip")
-            maybe_notify_backlog(pending, ledger)
-            return 0
-        active, why = on_call()
-        if active:
-            log(f"rename: {why} — on a call, skip (would steal focus into Voice Memos)")
-            maybe_notify_backlog(pending, ledger)
-            return 0
-        idle = idle_seconds()
-        if idle < IDLE_THRESHOLD_S:
-            log(f"rename: in use (idle {idle:.0f}s < {IDLE_THRESHOLD_S}s) — skip")
-            maybe_notify_backlog(pending, ledger)
-            return 0
+    # Build uid -> "YYYY-MM-DD — title", dropping anything already correct or gone.
+    plan: dict[str, str] = {}
+    for uid in pending:
+        e = ledger[uid]
+        date_prefix = (e.get("recorded") or "")[:10] or datetime.now().strftime("%Y-%m-%d")
+        target = f"{date_prefix} — {e['title']}"
+        if uid not in live:
+            log(f"rename: {uid[:8]} gone from app (deleted) — marking done")
+            e["app_renamed"] = True
+        elif live[uid] == target:
+            e["app_renamed"] = True  # already carries the right title
+        else:
+            plan[uid] = target
+    save_ledger(ledger)
 
-    if not pending:
+    if not plan:
         log("rename: nothing pending")
         return 0
 
-    # No duration filter here: sub-3s junk recordings are invisible to the transcribe
-    # pipeline but still occupy rows in the app, and default titles ("New Recording N")
-    # can collide with them.
-    all_memos = query_memos(min_duration=0.0)
-    titles = {m["uid"]: m["title"] for m in all_memos}
-    caff = subprocess.Popen(["caffeinate", "-d"])  # keep display awake during the pass
-    renamed = 0
-    try:
-        for uid in pending:
-            entry = ledger[uid]
-            recorded = entry.get("recorded")
-            date_prefix = recorded[:10] if recorded else datetime.now().strftime("%Y-%m-%d")
-            new_title = f"{date_prefix} — {entry.get('title')}"
-            current = titles.get(uid)
-            if current is None:
-                log(f"rename: {uid[:8]} not in DB (deleted?) — marking done")
-                entry["app_renamed"] = True
-                continue
-            if current == new_title:
-                entry["app_renamed"] = True
-                continue
-            # Duplicate titles used to be unrenameable: matching by title alone can't tell
-            # two "New Recording 6" rows apart, so BOTH stalled forever. gui_rename now
-            # disambiguates on the row's duration label; we just log it so a stall is
-            # visible in the log rather than looking like a mystery WRONGSEL.
-            dur = next((m["duration"] for m in all_memos if m["uid"] == uid), 0.0)
-            same_title = [m for m in all_memos if m["title"] == current]
-            if len(same_title) > 1:
-                log(f"rename: {uid[:8]} title {current!r} is shared by {len(same_title)} memos "
-                    f"— disambiguating on duration {ui_duration(dur)}")
-            result = gui_rename(current, new_title, dur)
-            if result == "AMBIGUOUS":
-                log(f"rename: {uid[:8]} title {current!r} duplicated and duration "
-                    f"{ui_duration(dur)} didn't isolate a row — skipped safely, not renamed")
-                continue
-            if result == "NOWINDOW":
-                log("rename: no Voice Memos window — aborting pass")
-                break
-            if result == "WRONGSEL":
-                # the edit box didn't hold the expected title — aborted safely, nothing renamed
-                log(f"rename: {uid[:8]} couldn't isolate {current!r} (list virtualized?) — "
-                    f"skipped safely, retry next pass")
-                continue
-            if result == "NOFIELD":
-                # not visible in the list — only mark done if the DB confirms it's already renamed
-                if db_titles_by_uid().get(uid) == new_title:
-                    entry["app_renamed"] = True
-                    log(f"rename: {uid[:8]} already renamed — marking done")
-                else:
-                    log(f"rename: {uid[:8]} field {current!r} not visible, not renamed — leaving pending")
-                save_ledger(ledger)
-                continue
-            if result != "DONE":
-                log(f"rename: {uid[:8]} unexpected result {result!r} — leaving pending")
-                continue
-            # DONE: confirm against the authoritative DB (the pre-verify already prevents
-            # renaming the wrong memo, so a mismatch here just means it didn't take).
-            fresh = db_titles_by_uid().get(uid)
-            if fresh == new_title:
-                entry["app_renamed"] = True
-                renamed += 1
-                save_ledger(ledger)
-                log(f"rename: ✓ {current!r} -> {new_title!r}")
-            else:
-                log(f"rename: {uid[:8]} didn't take (db {fresh!r}) — leaving pending")
-            # Can't use idle here — our own synthetic keystrokes reset the idle timer.
-            # Stop on a real signal we can detect mid-pass: the screen locking, or a call
-            # starting (camera/mic goes live). Either means "hands off the UI now."
-            if not args.force:
-                if screen_locked():
-                    log("rename: screen locked mid-pass — stopping")
-                    break
-                active, why = on_call()
-                if active:
-                    log(f"rename: {why} mid-pass — call started, stopping")
-                    break
-    finally:
-        caff.terminate()
-        save_ledger(ledger)
-    log(f"rename: pass done, {renamed} renamed")
+    mom = extract_model()
+    with tempfile.TemporaryDirectory() as td:
+        batch = Path(td) / "renames.tsv"
+        batch.write_text("".join(f"{uid}\t{title}\n" for uid, title in plan.items()))
+        cmd = [str(VMRENAME_BIN), str(mom), str(DB_PATH), "--batch", str(batch)]
+        if args.dry_run:
+            cmd.append("--dry-run")
+        log(f"rename: writing {len(plan)} title(s) via Core Data{' (dry-run)' if args.dry_run else ''}")
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+    for line in proc.stdout.splitlines():
+        log(f"  {line}")
+    if proc.returncode not in (0, 7):  # 7 = some rows failed; still process the successes
+        log(f"rename: vmrename failed rc={proc.returncode}: {proc.stderr.strip()[:200]}")
+        return 1
+
+    if args.dry_run:
+        return 0
+
+    # Mark done only the uids vmrename reported OK, then confirm against the DB.
+    ok_uids = {ln.split()[1] for ln in proc.stdout.splitlines() if ln.startswith("OK ")}
+    fresh = {m["uid"]: m["title"] for m in query_memos(min_duration=0.0)}
+    done = 0
+    for uid in ok_uids:
+        if fresh.get(uid) == plan[uid]:
+            ledger[uid]["app_renamed"] = True
+            done += 1
+        else:
+            log(f"rename: {uid[:8]} saved but DB shows {fresh.get(uid)!r} — leaving pending")
+    save_ledger(ledger)
+    log(f"rename: pass done, {done} applied")
     return 0
 
 
@@ -1110,7 +881,10 @@ def retitle_all(args) -> int:
             log(f"  title: {title!r}")
         if args.dry_run:
             continue
-        entry.update({"status": entry.get("status") or "titled",
+        # Force "titled" -- never preserve a prior "seeded"/"done", or the rename queue's
+        # status filter (historically) would skip a freshly-named memo. The queue now gates
+        # on app_renamed instead, but keeping status honest avoids future foot-guns.
+        entry.update({"status": "done" if entry.get("status") == "done" else "titled",
                       "recorded": m["recorded"].isoformat(timespec="seconds"),
                       "orig_title": entry.get("orig_title") or m["title"],
                       "title": title,
