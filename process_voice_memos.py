@@ -139,8 +139,12 @@ def save_ledger(ledger: dict) -> None:
 def query_memos(min_duration: float = MIN_DURATION_S) -> list[dict]:
     """Copy the live DB (+wal/+shm) to temp and read it read-only."""
     if not DB_PATH.exists():
-        log(f"ERROR no CloudRecordings.db at {DB_PATH}")
-        return []
+        # RAISE, don't return [] — a quiet empty list looks like "no new memos" and the
+        # failure guard never fires. Note exists() can also be False because TCC denied
+        # the stat, so this is not necessarily a missing file: in the 2026-07-23 outage
+        # stat() was permitted while open() was not, and a different TCC state would land
+        # here instead of on the PermissionError path.
+        raise FileNotFoundError(f"no readable CloudRecordings.db at {DB_PATH}")
     with tempfile.TemporaryDirectory() as td:
         tmp_db = Path(td) / "CloudRecordings.db"
         for suffix in ("", "-wal", "-shm"):
@@ -920,6 +924,13 @@ def fatal_message(exc: BaseException) -> str:
             "Voice Memos database. Fix: System Settings > Privacy & Security > Full Disk "
             f"Access, re-grant {TOOL_DIR}/.venv/bin/python3.11. "
             "Memos are queued and process once it's back."
+        )[:315]
+    if isinstance(exc, FileNotFoundError):
+        return (
+            "Voice memo transcription is DOWN: can't see the Voice Memos database. Either "
+            "the container moved, or Full Disk Access was revoked (a denied stat looks "
+            "identical to a missing file). Check System Settings > Privacy & Security > "
+            f"Full Disk Access for {TOOL_DIR}/.venv/bin/python3.11."
         )[:315]
     detail = str(exc)[:120].strip().rstrip(".")
     return (
