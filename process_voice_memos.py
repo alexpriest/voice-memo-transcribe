@@ -1068,7 +1068,11 @@ def retitle_all(args) -> int:
     ledger = load_ledger()
     memos = query_memos(min_duration=0.0)  # include the sub-3s taps
     clear_fatal_notify()
-    todo = [m for m in memos if not m["title"][:4].isdigit()]  # already "YYYY-MM-DD — ..." = done
+    # "already named by us" means a real YYYY-MM-DD prefix. A bare 4-digit test wrongly
+    # matched iOS's street-address titles ("7803 Deer Ridge Cir 9"), silently skipping
+    # every memo recorded at home -- the exact memos most worth naming.
+    dated = re.compile(r"^\d{4}-\d{2}-\d{2}\b")
+    todo = [m for m in memos if not dated.match(m["title"])]
     if args.limit:
         todo = todo[: args.limit]
     log(f"{len(memos)} memos in app, {len(todo)} without a dated title")
