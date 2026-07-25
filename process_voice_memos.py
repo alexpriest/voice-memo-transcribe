@@ -705,6 +705,65 @@ def rename_queue(args) -> int:
     return 0
 
 
+# The Kit Activity Log is read back by harvesting every line that starts with
+# "- " straight into an LLM system prompt, and the title interpolated below is
+# LLM-generated from the (attacker-influenceable) transcript — so an embedded
+# newline could forge a second well-formed bullet into another persona's
+# instructions. This block implements the canonical sanitizeLogText spec (v5)
+# shared by every writer of this log, in both Python and TypeScript. The order
+# of operations and the character classes must stay byte-identical across all
+# writers — a differential test runs the same vector file against each
+# implementation.
+
+# Spec step 2: every character that starts a new line for a `split("\n")`
+# reader, for `str.splitlines()`, or for an LLM reading the file, flattened to
+# a single space. \x1C-\x1E are `str.splitlines()` breaks and belong here;
+# \x1F is NOT a line break, so step 3 below deletes it outright instead of
+# leaving a space. The set is spelled out explicitly (not via `\s`) so it is
+# stated in the same form in every writer: JS `\s` does not match \x1C-\x1E.
+_LINE_BREAKS = re.compile("[\r\n\x0B\x0C\x1C\x1D\x1E\x85\u2028\u2029]+")
+
+# Spec step 3: remaining C0 controls and DEL are deleted with no replacement
+# (this catches \x1F; \t is whitespace and handled by the WS passes below;
+# \x1C-\x1E were already flattened in step 2).
+_CONTROLS = re.compile("[\x00-\x08\x0E-\x1F\x7F]")
+
+# The explicit whitespace class shared byte-for-byte with the TS writer. NOT
+# `\s`: Python's `\s` also matches \x1C-\x1F (handled above) and misses
+# U+FEFF (BOM); JS `\s` misses \x1C-\x1F. The explicit class depends on neither.
+_WS = "[ \t\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000\uFEFF]"
+
+# Spec step 4: strip leading markup — runs of whitespace, and runs of [-*+>#]
+# ONLY when the run is immediately followed by whitespace or end-of-string.
+# "- ", "> ", "  - > # " and a bare "---" strip; "+15551234567", "-3 lbs",
+# "*star*", "#kit" and "---divider" survive, because a marker run glued to
+# content is content. The older greedy `^[\s\-*+>#]+` ate the leading "+" off
+# an E.164 sender and inverted the sign on things like "-3 lbs".
+_LEADING_MARKERS = re.compile(f"^(?:{_WS}+|[-*+>#]+(?={_WS}|$))+")
+
+# Spec steps 5-6: collapse internal whitespace runs to one space, trim edges.
+_WS_RUNS = re.compile(f"{_WS}+")
+_WS_EDGES = re.compile(f"^{_WS}+|{_WS}+$")
+
+
+def sanitize_log_text(text) -> str:
+    """Flatten untrusted text so it cannot forge a log entry.
+
+    Flattening line breaks is the part that closes the forgery hole. Stripping
+    leading markers is cosmetic defence-in-depth: this text is interpolated
+    after `- HH:MM [voice-memos] `, so a marker in it cannot begin a line for a
+    reader that splits on newlines. None becomes ""; any other non-string is
+    coerced with str(). No Unicode normalization happens here — content is
+    preserved; NFKC is the reader's job.
+    """
+    text = "" if text is None else str(text)
+    text = _LINE_BREAKS.sub(" ", text)
+    text = _CONTROLS.sub("", text)
+    text = _LEADING_MARKERS.sub("", text)
+    text = _WS_RUNS.sub(" ", text)
+    return _WS_EDGES.sub("", text)
+
+
 def append_activity(memo: dict, flags: list[str], title: str) -> None:
     now = datetime.now()
     path = ACTIVITY_DIR / f"{now:%Y-%m-%d} Kit Activity Log.md"
@@ -714,10 +773,18 @@ def append_activity(memo: dict, flags: list[str], title: str) -> None:
             f"---\ncreated: '[[{now:%Y-%m-%d}]]'\ntags: activity-log\n---\n"
             f"# Kit Activity Log — {now:%Y-%m-%d}\n\n"
         )
-    flag_str = f"{len(flags)} flag(s)" if flags else "clean"
+    # Every interpolated field goes through sanitize_log_text: the title is
+    # LLM-generated from the transcript, and the derived fields are sanitized
+    # too so the bullet stays one line no matter what upstream code produces.
+    safe_title = sanitize_log_text(title)
+    safe_duration = sanitize_log_text(fmt_duration(memo["duration"]))
+    safe_day = sanitize_log_text(f"{memo['recorded']:%-m/%-d}")
+    safe_flag_str = sanitize_log_text(
+        f"{len(flags)} flag(s)" if flags else "clean"
+    )
     line = (
-        f"- {now:%H:%M} [voice-memos] Transcribed \"{title}\" "
-        f"({fmt_duration(memo['duration'])}) → {memo['recorded']:%-m/%-d} daily note. {flag_str}\n"
+        f"- {now:%H:%M} [voice-memos] Transcribed \"{safe_title}\" "
+        f"({safe_duration}) → {safe_day} daily note. {safe_flag_str}\n"
     )
     with path.open("a") as f:
         f.write(line)
