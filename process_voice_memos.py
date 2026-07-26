@@ -354,21 +354,44 @@ def enrich(memo: dict, transcription: dict, entities: str, notify_enabled: bool)
         notify_instruction=notify_instruction,
     )
 
+    # Budget scales with the transcript for the same reason the timeout does: the
+    # model re-emits the entire cleaned transcript, so a long memo costs more than
+    # a short one. A flat $0.50 was the real binding constraint on the 27-minute
+    # memo of 2026-07-25 — it exited "Exceeded USD budget (0.5)" after ~9 minutes
+    # of work, wasting the whole spend and producing nothing. Capped so a runaway
+    # can't spend without limit.
+    enrich_budget = min(3.00, max(0.50, len(prompt) / 1000 * 0.08))
     cmd = [
         CLAUDE_BIN, "-p",
         "--permission-mode", "bypassPermissions",
         "--model", CLAUDE_MODEL,
-        "--max-budget-usd", "0.50",
+        "--max-budget-usd", f"{enrich_budget:.2f}",
         prompt,
     ]
-    # Retry: claude -p can fail transiently (flaky API moment). One hiccup must not
-    # demote a memo to a raw transcript.
+    # The model has to re-emit the whole cleaned transcript, so the time it needs
+    # scales with the transcript, not with a constant. A flat 420s was fine for a
+    # typical memo and impossible for a 27-minute one (2026-07-25): every attempt
+    # timed out, and because a timeout was retried like a transient error, each
+    # run burned 21 minutes before falling back to the raw transcript anyway.
+    #
+    # So: give it time proportional to the input, and treat a timeout as a verdict
+    # rather than a hiccup. A flaky API moment is worth retrying with identical
+    # input; a deterministic timeout is not — it just costs the same wall-clock
+    # again. Transient failures keep the original 3 attempts.
+    enrich_timeout = min(900, max(420, int(len(prompt) / 1000 * 45)))
     for attempt in range(1, 4):
         try:
             proc = subprocess.run(
-                cmd, cwd=str(VAULT), capture_output=True, text=True, timeout=420
+                cmd, cwd=str(VAULT), capture_output=True, text=True, timeout=enrich_timeout
             )
-        except (subprocess.TimeoutExpired, OSError) as e:
+        except subprocess.TimeoutExpired:
+            # One generous attempt, then take the raw transcript. Retrying costs
+            # the same wall-clock for the same result, and falling back is cheap
+            # now that the caller writes and ledgers the memo either way — the
+            # memo lands, just less tidy.
+            log(f"  enrich timed out after {enrich_timeout}s — using the raw transcript")
+            return None
+        except OSError as e:
             log(f"  enrich attempt {attempt} error: {e}")
         else:
             if proc.returncode == 0:
@@ -376,6 +399,11 @@ def enrich(memo: dict, transcription: dict, entities: str, notify_enabled: bool)
                 if parsed:
                     return parsed
                 log(f"  enrich attempt {attempt}: unparseable stdout: {proc.stdout[:200]!r}")
+            elif "Exceeded USD budget" in (proc.stdout or "") + (proc.stderr or ""):
+                # Deterministic, like the timeout: the same input costs the same
+                # money, so retrying just spends it again for the same failure.
+                log(f"  enrich exceeded its ${enrich_budget:.2f} budget — using the raw transcript")
+                return None
             else:
                 log(f"  enrich attempt {attempt}: exit {proc.returncode} "
                     f"stdout={proc.stdout[:200]!r} stderr={proc.stderr[:200]!r}")
@@ -1114,20 +1142,35 @@ def main() -> int:
             log(f"  [dry-run] should_notify={should_notify} notify_text={notify_text!r}")
             continue
 
-        craft_toggle_id = None
-        if DEST == "craft":
-            craft_toggle_id = place_in_craft(
-                m, body, uncertainties, clever_title,
-                prev_toggle_id=(ledger.get(m["uid"]) or {}).get("craft_toggle_id"),
-            )
-            note_ref = f"Craft/Daily Notes/{m['recorded']:%Y/%m-%B/%Y-%m-%d} (toggle)"
-        else:
-            audio_filename = copy_audio(m, clever_title)
-            note_path = daily_note_path(m["recorded"])
-            callout = build_callout(m, audio_filename, body, uncertainties, clever_title)
-            insert_callout(note_path, callout, m["uid"])
-            note_ref = str(note_path.relative_to(VAULT))
-        append_activity(m, uncertainties, clever_title)
+        # Same protection the transcribe step already has, for the same reason:
+        # never let one memo kill the run. Without it a write failure escaped
+        # main() BEFORE the ledger was saved, so the memo stayed un-marked and
+        # every later trigger re-transcribed it, re-failed, and never reached
+        # the memos queued behind it. One 27-minute memo wedged the whole
+        # pipeline this way on 2026-07-25 (Craft 400: block over 20k chars).
+        try:
+            craft_toggle_id = None
+            if DEST == "craft":
+                craft_toggle_id = place_in_craft(
+                    m, body, uncertainties, clever_title,
+                    prev_toggle_id=(ledger.get(m["uid"]) or {}).get("craft_toggle_id"),
+                )
+                note_ref = f"Craft/Daily Notes/{m['recorded']:%Y/%m-%B/%Y-%m-%d} (toggle)"
+            else:
+                audio_filename = copy_audio(m, clever_title)
+                note_path = daily_note_path(m["recorded"])
+                callout = build_callout(m, audio_filename, body, uncertainties, clever_title)
+                insert_callout(note_path, callout, m["uid"])
+                note_ref = str(note_path.relative_to(VAULT))
+            append_activity(m, uncertainties, clever_title)
+        except Exception as e:  # noqa: BLE001 - never let one memo kill the run
+            log(f"  write error: {e}")
+            ledger[m["uid"]] = {"status": "error", "error": str(e)[:200],
+                                "orig_title": m["title"],
+                                "recorded": m["recorded"].isoformat(timespec="seconds"),
+                                "processed_at": datetime.now().isoformat(timespec="seconds")}
+            save_ledger(ledger)
+            continue
         # app rename is handled asynchronously by the --rename-queue runner when the
         # screen is unlocked and idle (see rename_queue); transcription never touches the UI.
         ledger[m["uid"]] = {

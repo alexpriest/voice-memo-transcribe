@@ -130,6 +130,63 @@ def _find_existing_group(blocks, toggle_id) -> list[str]:
     return ids
 
 
+# Craft rejects any single block over 20,000 characters with a 400. Stay well
+# under it: the cost of an extra block is invisible, the cost of a 400 is the
+# whole run.
+MAX_BLOCK_CHARS = 15_000
+
+# Craft rejects uploads over 5MB. Kept just under so a boundary case doesn't 400.
+AUDIO_UPLOAD_LIMIT = 4_900_000
+
+
+def _split_oversized(text: str, limit: int = MAX_BLOCK_CHARS) -> list[str]:
+    """Break one over-long paragraph on the nicest boundary available."""
+    out = []
+    while len(text) > limit:
+        window = text[:limit]
+        # Prefer a sentence end, then any whitespace, then a hard cut.
+        cut = max(window.rfind(". "), window.rfind("? "), window.rfind("! "))
+        cut = cut + 1 if cut > limit // 2 else -1
+        if cut == -1:
+            ws = window.rfind(" ")
+            cut = ws if ws > limit // 2 else limit
+        out.append(text[:cut].strip())
+        text = text[cut:].strip()
+    if text:
+        out.append(text)
+    return out
+
+
+def _paragraphs_for_craft(transcript: str) -> list[str]:
+    """Transcript -> Craft-safe paragraph blocks.
+
+    Two hazards, both hit in production on a 27-minute memo (2026-07-25):
+
+    1. The cleaned transcript is separated by blank lines, but when enrichment
+       fails the caller falls back to the RAW transcript, which is separated by
+       single newlines. Splitting only on "\\n\\n" then yields ONE paragraph
+       containing the entire memo.
+    2. Craft 400s on any block over 20,000 characters. That 400 propagated out
+       of the run, so the memo was never marked done and every later trigger
+       re-transcribed and re-failed it forever, blocking every memo behind it.
+
+    So: prefer blank-line paragraphs, fall back to single newlines when that
+    yields one huge blob, then hard-split anything still over the limit.
+    """
+    text = (transcript or "").strip()
+    if not text:
+        return ["(no transcript)"]
+
+    paras = [p.strip() for p in text.split("\n\n") if p.strip()]
+    if len(paras) <= 1 and len(text) > MAX_BLOCK_CHARS:
+        paras = [p.strip() for p in text.split("\n") if p.strip()] or [text]
+
+    out: list[str] = []
+    for p in paras:
+        out.extend(_split_oversized(p) if len(p) > MAX_BLOCK_CHARS else [p])
+    return out or ["(no transcript)"]
+
+
 def write_voice_memo(*, date: str, title: str, time_label: str, duration_label: str,
                      transcript: str, uncertainties, audio_path: str, pretty_name: str,
                      shortid: str, prev_toggle_id: str | None = None) -> dict:
@@ -152,7 +209,7 @@ def write_voice_memo(*, date: str, title: str, time_label: str, duration_label: 
     header = f"### Voice memo: {title} · {time_label} · {duration_label}"
     blocks = [{"type": "text", "markdown": "---", "indentationLevel": 0},
               {"type": "text", "markdown": header, "listStyle": "toggle", "indentationLevel": 0}]
-    paragraphs = [p.strip() for p in transcript.strip().split("\n\n") if p.strip()] or ["(no transcript)"]
+    paragraphs = _paragraphs_for_craft(transcript)
     for p in paragraphs:
         blocks.append({"type": "text", "markdown": p, "indentationLevel": 1})
     if uncertainties:
@@ -169,7 +226,23 @@ def write_voice_memo(*, date: str, title: str, time_label: str, duration_label: 
 
     # 2) upload the audio bytes (loose block), then re-attach as a named, nested
     #    file block after the transcript, and delete the loose upload block.
+    #    Craft caps uploads at 5MB, which a long memo exceeds (a 27-minute one is
+    #    ~5.3MB). The transcript is the artifact worth keeping and it is already
+    #    written by this point, so an oversized attachment must not throw the whole
+    #    memo away — the audio still exists in Voice Memos either way. Say so in
+    #    the note rather than leaving a silent gap where an attachment should be.
     audio_bytes = Path(audio_path).read_bytes()
+    if len(audio_bytes) > AUDIO_UPLOAD_LIMIT:
+        mb = len(audio_bytes) / 1_000_000
+        _req("POST", f"{base}/blocks", cred, json_body={
+            "blocks": [{"type": "text",
+                        "markdown": f"*Audio not attached — {mb:.1f}MB exceeds Craft's 5MB limit. "
+                                    f"The recording is in Voice Memos.*",
+                        "indentationLevel": 1}],
+            "position": {"siblingId": last_text_id, "position": "after"},
+        })
+        return {"toggle_id": toggle_id, "audio_block_id": None}
+
     up = _req("POST", f"{base}/upload?siblingId={last_text_id}&position=after",
               cred, raw_body=audio_bytes, content_type="audio/mp4")
     asset_url = up.get("assetUrl")
