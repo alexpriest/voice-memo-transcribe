@@ -131,7 +131,7 @@ texts a single heads-up. A memo is never lost.
   This folder is added to the vault `.gitignore`.
 - **Ledger:** `~/Code/tools/voice-memo-transcribe/state/processed.json`, keyed by `ZUNIQUEID` →
   `{processed_at, note_path, status, flags}`. Idempotent; re-runs skip done memos.
-- **Activity log:** append one line to `Claude/System/Activity/<YYYY-MM-DD> Kit Activity Log.md`
+- **Activity log:** append one line to `Claude/System/Activity/<YYYY-MM-DD> Activity Log.md`
   (create from template if missing) under source tag `[voice-memos]`:
   `- HH:MM [voice-memos] Transcribed "{title}" ({dur}) → {date} daily note. {clean | N flags}`.
 

@@ -1,7 +1,7 @@
 """An LLM-generated memo title must not be able to forge an activity-log bullet.
 
 append_activity() interpolates the Claude-written title into a "- HH:MM
-[voice-memos] ..." bullet in the shared Kit Activity Log. Readers harvest every
+[voice-memos] ..." bullet in the shared Activity Log. Readers harvest every
 line starting with "- " straight into an LLM system prompt, so a newline in the
 title (whose content derives from the untrusted transcript) is a
 prompt-injection primitive.
@@ -26,7 +26,7 @@ def _sanitize():
 
 def _harvest(log_dir) -> list[str]:
     """Mimic how the log readers pull entries out of the file."""
-    written = next(log_dir.glob("* Kit Activity Log.md")).read_text()
+    written = next(log_dir.glob("* Activity Log.md")).read_text()
     return [line for line in written.split("\n") if line.startswith("- ")]
 
 

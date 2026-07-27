@@ -733,7 +733,7 @@ def rename_queue(args) -> int:
     return 0
 
 
-# The Kit Activity Log is read back by harvesting every line that starts with
+# The Activity Log is read back by harvesting every line that starts with
 # "- " straight into an LLM system prompt, and the title interpolated below is
 # LLM-generated from the (attacker-influenceable) transcript — so an embedded
 # newline could forge a second well-formed bullet into another persona's
@@ -794,12 +794,12 @@ def sanitize_log_text(text) -> str:
 
 def append_activity(memo: dict, flags: list[str], title: str) -> None:
     now = datetime.now()
-    path = ACTIVITY_DIR / f"{now:%Y-%m-%d} Kit Activity Log.md"
+    path = ACTIVITY_DIR / f"{now:%Y-%m-%d} Activity Log.md"
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             f"---\ncreated: '[[{now:%Y-%m-%d}]]'\ntags: activity-log\n---\n"
-            f"# Kit Activity Log — {now:%Y-%m-%d}\n\n"
+            f"# Activity Log — {now:%Y-%m-%d}\n\n"
         )
     # Every interpolated field goes through sanitize_log_text: the title is
     # LLM-generated from the transcript, and the derived fields are sanitized
