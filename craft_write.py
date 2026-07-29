@@ -4,7 +4,9 @@ Structure produced (matches the format Alex specced):
 
     ───────────────────────────────────                 (divider; keeps the memo
     ▸ ### Voice memo: <title> · <time> · <duration>      from running into the
-         <transcript paragraph 1>                        rest of the daily note)
+         <transcript paragraph 1>                        rest of the daily note.
+                                                         ONE per note — see
+                                                         _needs_divider)
          <transcript paragraph 2>
          *Flagged: …*                                    (only if uncertainties)
          🎵 <pretty-name>.m4a                             (nested, plays)
@@ -99,6 +101,25 @@ def _blocks(base, cred, date):
     """Fetch a daily note's block tree (top-level content list)."""
     d = _req("GET", f"{base}/blocks?date={date}", cred)
     return d.get("content", []) if isinstance(d, dict) else []
+
+
+def _needs_divider(content) -> bool:
+    """Should this memo lay down a divider? One per note, not one per write.
+
+    Same rule as craft_append.needs_separator (craft-mirror) — keep them in step.
+    Test what the write will land against, not the note as a whole: nothing there,
+    an existing divider, or a task means no rule; prose means yes. Alex flagged
+    stacked `***` as noise on 2026-07-29, and he separates his own timestamped
+    journal entries with `***`, so "note already contains a divider" is the wrong
+    test — it would suppress the one rule genuinely needed on a journaled day.
+    """
+    for block in reversed(content or []):
+        if not (block.get("markdown") or "").strip():
+            continue
+        if block.get("type") == "line":
+            return False
+        return block.get("listStyle") != "task"
+    return False
 
 
 def _find_existing_group(blocks, toggle_id) -> list[str]:
@@ -200,15 +221,19 @@ def write_voice_memo(*, date: str, title: str, time_label: str, duration_label: 
     base, cred = creds()
 
     # Replace any prior group for this memo (idempotent reprocess).
-    old = _find_existing_group(_blocks(base, cred, date), prev_toggle_id)
+    content = _blocks(base, cred, date)
+    old = _find_existing_group(content, prev_toggle_id)
     if old:
         _req("DELETE", f"{base}/blocks", cred, json_body={"blockIds": old})
+        content = [b for b in content if b.get("id") not in set(old)]
 
-    # 1) divider, then toggle header + transcript paragraphs (+ flags) at indent 1.
-    #    The divider stops the memo from running into whatever Alex already wrote.
+    # 1) divider (only if the memo would otherwise run into Alex's own writing —
+    #    see _needs_divider), then toggle header + transcript paragraphs (+ flags)
+    #    at indent 1.
+    divider = _needs_divider(content)
     header = f"### Voice memo: {title} · {time_label} · {duration_label}"
-    blocks = [{"type": "text", "markdown": "---", "indentationLevel": 0},
-              {"type": "text", "markdown": header, "listStyle": "toggle", "indentationLevel": 0}]
+    blocks = ([{"type": "text", "markdown": "---", "indentationLevel": 0}] if divider else []) + [
+        {"type": "text", "markdown": header, "listStyle": "toggle", "indentationLevel": 0}]
     paragraphs = _paragraphs_for_craft(transcript)
     for p in paragraphs:
         blocks.append({"type": "text", "markdown": p, "indentationLevel": 1})
@@ -219,9 +244,10 @@ def write_voice_memo(*, date: str, title: str, time_label: str, duration_label: 
     created = _req("POST", f"{base}/blocks", cred,
                    json_body={"blocks": blocks, "position": {"date": date, "position": "end"}})
     items = created.get("items", [])
-    if len(items) < 2:
-        raise CraftError(f"expected divider + toggle, got {len(items)} block(s)")
-    toggle_id = items[1]["id"]  # items[0] is the divider
+    toggle_index = 1 if divider else 0  # items[0] is the divider when there is one
+    if len(items) <= toggle_index:
+        raise CraftError(f"expected a toggle at index {toggle_index}, got {len(items)} block(s)")
+    toggle_id = items[toggle_index]["id"]
     last_text_id = items[-1]["id"]
 
     # 2) upload the audio bytes (loose block), then re-attach as a named, nested
