@@ -73,6 +73,8 @@ MIN_MTIME_AGE_S = 30  # file must have been still for this long (finished syncin
 # unrelated directory change or the 06:30 calendar run. Wait it out in-process instead.
 READY_WAIT_TIMEOUT_S = 900
 READY_POLL_S = 10
+# How many times a memo that errored may be retried on later runs before it is left alone.
+MAX_ERROR_RETRIES = 5
 
 PROJECT_NOUNS = ["Cartographer", "Duckbill", "Firesale", "Anthimeros", "Syntensor", "Halcie"]
 
@@ -1043,7 +1045,14 @@ def select_memos(memos: list[dict], ledger: dict, args) -> list[dict]:
             if entry and entry.get("status") == "done":
                 continue
         else:
-            if entry is not None:  # seeded or done => skip
+            # A transient failure (Craft 502, network blip) must not strand a memo
+            # forever. Retry errored entries a bounded number of times; anything else
+            # already in the ledger (seeded/done) is finished. 2026-07-30: one 502
+            # permanently orphaned a memo that had already cost a full transcribe.
+            if entry is not None and entry.get("status") == "error":
+                if int(entry.get("attempts") or 0) >= MAX_ERROR_RETRIES:
+                    continue
+            elif entry is not None:  # seeded or done => skip
                 continue
         out.append(m)
     if args.limit:
@@ -1123,7 +1132,9 @@ def main() -> int:
             tr = transcribe(m["audio"])
         except Exception as e:  # noqa: BLE001 - never let one memo kill the run
             log(f"  transcribe error: {e}")
+            prev = ledger.get(m["uid"]) or {}
             ledger[m["uid"]] = {"status": "error", "error": str(e)[:200],
+                                "attempts": int(prev.get("attempts") or 0) + 1,
                                 "at": datetime.now().isoformat(timespec="seconds")}
             save_ledger(ledger)
             continue
@@ -1188,8 +1199,14 @@ def main() -> int:
             append_activity(m, uncertainties, clever_title)
         except Exception as e:  # noqa: BLE001 - never let one memo kill the run
             log(f"  write error: {e}")
+            prev = ledger.get(m["uid"]) or {}
             ledger[m["uid"]] = {"status": "error", "error": str(e)[:200],
                                 "orig_title": m["title"],
+                                "attempts": int(prev.get("attempts") or 0) + 1,
+                                # Set when the toggle was already created — lets the retry
+                                # replace the partial group instead of duplicating it.
+                                "craft_toggle_id": getattr(e, "toggle_id", None)
+                                                   or prev.get("craft_toggle_id"),
                                 "recorded": m["recorded"].isoformat(timespec="seconds"),
                                 "processed_at": datetime.now().isoformat(timespec="seconds")}
             save_ledger(ledger)

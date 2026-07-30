@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -39,6 +40,12 @@ from pathlib import Path
 _UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 _ENV_FILE = Path(__file__).resolve().parent / ".env"
+
+# Gateway statuses worth replaying — the request never reached the app, so a POST is safe to
+# repeat. 500 is deliberately excluded: it may have partially applied.
+_RETRY_STATUS = {429, 502, 503, 504}
+_REQ_ATTEMPTS = 4
+_REQ_BACKOFF_S = 2.0
 
 
 class CraftError(Exception):
@@ -87,12 +94,26 @@ def _req(method: str, url: str, cred: str, *, json_body=None, raw_body=None, con
         data = raw_body
         headers["Content-Type"] = content_type or "application/octet-stream"
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            body = r.read().decode("utf-8")
-            return json.loads(body) if body.strip() else {}
-    except urllib.error.HTTPError as e:
-        raise CraftError(f"{method} {url.split('?')[0]} -> {e.code}: {e.read().decode('utf-8','replace')[:200]}")
+    # Craft's edge returns transient 502/503/504 (hit 2026-07-30, stranding a memo that had
+    # already cost a full transcribe+enrich). Retry gateway-level failures only: those mean the
+    # request did not reach the app, so replaying a non-idempotent POST won't duplicate a block.
+    # A bare 500 is NOT retried — that one may have partially applied.
+    last = None
+    for attempt in range(1, _REQ_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                body = r.read().decode("utf-8")
+                return json.loads(body) if body.strip() else {}
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:200]
+            last = CraftError(f"{method} {url.split('?')[0]} -> {e.code}: {detail}")
+            if e.code not in _RETRY_STATUS:
+                raise last
+        except (urllib.error.URLError, TimeoutError) as e:
+            last = CraftError(f"{method} {url.split('?')[0]} -> network error: {e}")
+        if attempt < _REQ_ATTEMPTS:
+            time.sleep(_REQ_BACKOFF_S * (2 ** (attempt - 1)))
+    raise last
 
 
 # --------------------------------------------------------------------------- #
@@ -250,13 +271,29 @@ def write_voice_memo(*, date: str, title: str, time_label: str, duration_label: 
     toggle_id = items[toggle_index]["id"]
     last_text_id = items[-1]["id"]
 
-    # 2) upload the audio bytes (loose block), then re-attach as a named, nested
-    #    file block after the transcript, and delete the loose upload block.
-    #    Craft caps uploads at 5MB, which a long memo exceeds (a 27-minute one is
-    #    ~5.3MB). The transcript is the artifact worth keeping and it is already
-    #    written by this point, so an oversized attachment must not throw the whole
-    #    memo away — the audio still exists in Voice Memos either way. Say so in
-    #    the note rather than leaving a silent gap where an attachment should be.
+    # 2) attach the audio. If this fails the transcript is already on the page, so the
+    #    toggle id must reach the caller — otherwise the ledger records an error with no
+    #    toggle, _find_existing_group can't match it, and a retry appends a DUPLICATE
+    #    group. (2026-07-30: a 502 here left an orphan top-level upload block behind.)
+    try:
+        audio_block_id = _attach_audio(base, cred, audio_path, pretty_name, last_text_id)
+    except Exception as e:  # noqa: BLE001 - any failure here must still carry the toggle
+        e.toggle_id = toggle_id
+        raise
+    return {"toggle_id": toggle_id, "audio_block_id": audio_block_id}
+
+
+def _attach_audio(base, cred, audio_path: str, pretty_name: str,
+                  last_text_id: str) -> str | None:
+    """Upload the audio (loose block), re-attach it as a named block nested under the
+    toggle after the transcript, and delete the loose upload block.
+
+    Craft caps uploads at 5MB, which a long memo exceeds (a 27-minute one is ~5.3MB).
+    The transcript is the artifact worth keeping and it is already written by this
+    point, so an oversized attachment must not throw the whole memo away — the audio
+    still exists in Voice Memos either way. Say so in the note rather than leaving a
+    silent gap where an attachment should be.
+    """
     audio_bytes = Path(audio_path).read_bytes()
     if len(audio_bytes) > AUDIO_UPLOAD_LIMIT:
         mb = len(audio_bytes) / 1_000_000
@@ -267,7 +304,7 @@ def write_voice_memo(*, date: str, title: str, time_label: str, duration_label: 
                         "indentationLevel": 1}],
             "position": {"siblingId": last_text_id, "position": "after"},
         })
-        return {"toggle_id": toggle_id, "audio_block_id": None}
+        return None
 
     up = _req("POST", f"{base}/upload?siblingId={last_text_id}&position=after",
               cred, raw_body=audio_bytes, content_type="audio/mp4")
@@ -287,4 +324,4 @@ def write_voice_memo(*, date: str, title: str, time_label: str, duration_label: 
         except CraftError:
             pass  # a lingering loose block is cosmetic, not worth failing the memo
 
-    return {"toggle_id": toggle_id, "audio_block_id": audio_block_id}
+    return audio_block_id
