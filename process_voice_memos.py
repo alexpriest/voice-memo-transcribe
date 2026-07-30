@@ -68,6 +68,11 @@ CLAUDE_MODEL = "claude-sonnet-4-6"
 CORE_DATA_EPOCH = 978307200  # seconds between 1970-01-01 and 2001-01-01
 MIN_DURATION_S = 3.0
 MIN_MTIME_AGE_S = 30  # file must have been still for this long (finished syncing)
+# The launchd job is WatchPaths-triggered, so it fires the instant a memo lands — i.e. always
+# inside the MIN_MTIME_AGE_S window. Skipping and exiting loses the memo until the next
+# unrelated directory change or the 06:30 calendar run. Wait it out in-process instead.
+READY_WAIT_TIMEOUT_S = 900
+READY_POLL_S = 10
 
 PROJECT_NOUNS = ["Cartographer", "Duckbill", "Firesale", "Anthimeros", "Syntensor", "Halcie"]
 
@@ -198,6 +203,24 @@ def is_file_ready(audio: Path) -> bool:
         return False
     age = datetime.now().timestamp() - audio.stat().st_mtime
     return age >= MIN_MTIME_AGE_S
+
+
+def wait_until_ready(audio: Path, timeout_s: int = READY_WAIT_TIMEOUT_S) -> bool:
+    """Block until the file has been still long enough, or timeout.
+
+    Nothing re-triggers this job after it exits, so a not-ready memo must be waited
+    on here rather than deferred to a future run that may not happen for hours.
+    """
+    deadline = time.monotonic() + timeout_s
+    waited = False
+    while not is_file_ready(audio):
+        if time.monotonic() >= deadline:
+            return False
+        if not waited:
+            log(f"  waiting for sync to settle: {audio.name}")
+            waited = True
+        time.sleep(READY_POLL_S)
+    return True
 
 
 # ---------------------------------------------------------------------------- #
@@ -1091,8 +1114,8 @@ def main() -> int:
     notify_enabled = not args.no_notify
 
     for m in todo:
-        if not is_file_ready(m["audio"]):
-            log(f"  skip (not ready / still syncing): {m['title']}")
+        if not wait_until_ready(m["audio"]):
+            log(f"  skip (still syncing after {READY_WAIT_TIMEOUT_S}s): {m['title']}")
             continue
         log(f"→ {m['title']} ({fmt_duration(m['duration'])}, {m['recorded']:%Y-%m-%d %H:%M})")
 
