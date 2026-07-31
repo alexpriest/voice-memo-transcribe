@@ -100,8 +100,42 @@ open: a broken notifier logs and gets out of the way rather than becoming a seco
 Creates the venv, installs mlx-whisper, pre-downloads the model, loads the launchd agent, and
 adds the audio folder to the vault `.gitignore`.
 
+## Reliability — three failure modes, all fixed 2026-07-30
+
+A single memo (2026-07-30) tripped all three in sequence. Worth understanding before touching
+this code, because two of them fail *silently*.
+
+**1. The sync race.** The launchd job is `WatchPaths`-triggered on the Recordings directory, so
+it fires the instant a memo lands — which is always inside the `MIN_MTIME_AGE_S` (30s) window
+that `is_file_ready()` uses to detect a still-syncing file. The trigger and the guard were in
+direct opposition: wake up, see a too-fresh file, log `skip`, exit. Nothing rescheduled it, so
+the memo waited for an unrelated directory change or the 06:30 calendar run. 2026-07-25 hit this
+and recovered by luck; 2026-07-30 didn't.
+→ `wait_until_ready()` now blocks and polls rather than skipping. A `StartInterval` of 1800s was
+added to the plist as a backstop for any *other* missed trigger (asleep machine, crash, job
+unloaded). Both triggers coexist — verify with `launchctl print` showing `watching = 1` **and**
+`run interval = 1800`.
+
+**2. No retry on the Craft write.** `craft_write._req()` had none, so one transient gateway error
+killed a write that had already cost a full transcribe + enrich. Craft's edge does return
+intermittent 502s — observed repeatedly.
+→ Now retries `429/502/503/504` and network errors with backoff. **`500` is deliberately NOT
+retried** — unlike a gateway error it may have partially applied, and replaying a non-idempotent
+`POST /blocks` would duplicate.
+
+**3. `status: "error"` was terminal.** `select_memos()` skipped *any* ledger entry, so a memo that
+errored could never be picked up again by any trigger. Permanent, not delayed.
+→ Errors are now retried up to `MAX_ERROR_RETRIES`, with an `attempts` counter.
+
+⚠️ **The trap in fixing #3:** retrying a *partially* written memo would append a duplicate toggle,
+because `_find_existing_group()` can only match on a toggle id and the error entry didn't record
+one. `write_voice_memo` now attaches `toggle_id` to the exception and the error ledger entry
+persists it, so the retry *replaces* the partial group. If you add a new failure path between
+toggle creation and completion, it must preserve the toggle id the same way.
+
 ## Ops
 
 - Logs: `~/Library/Logs/voice-memo-transcribe.log`
 - Ledger: `state/processed.json`
 - One-time backfill: `python process_voice_memos.py --backfill-since YYYY-MM-DD`
+- Force a specific memo (ignores ledger status): `python process_voice_memos.py --uids <UID>`
