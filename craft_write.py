@@ -49,7 +49,7 @@ _REQ_BACKOFF_S = 2.0
 
 
 class CraftError(Exception):
-    pass
+    status: int | None = None  # HTTP status when the failure came back as one
 
 
 def _load_env_file():
@@ -107,6 +107,7 @@ def _req(method: str, url: str, cred: str, *, json_body=None, raw_body=None, con
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")[:200]
             last = CraftError(f"{method} {url.split('?')[0]} -> {e.code}: {detail}")
+            last.status = e.code
             if e.code not in _RETRY_STATUS:
                 raise last
         except (urllib.error.URLError, TimeoutError) as e:
@@ -119,8 +120,21 @@ def _req(method: str, url: str, cred: str, *, json_body=None, raw_body=None, con
 # --------------------------------------------------------------------------- #
 
 def _blocks(base, cred, date):
-    """Fetch a daily note's block tree (top-level content list)."""
-    d = _req("GET", f"{base}/blocks?date={date}", cred)
+    """Fetch a daily note's block tree (top-level content list).
+
+    A date with no daily note yet 404s here (`NOT_FOUND_ERROR`, resourceType `dailyNote`).
+    That is not a failure: `POST /blocks` with a `date` position **auto-creates** the note
+    (craft-mirror/README.md; re-verified 2026-08-03), so a missing note is simply an empty
+    one. Raising instead stranded the memo in the error/retry loop — and because enrichment
+    used to send its own SMS, every retry texted Alex again (2026-08-02: four messages for
+    one memo).
+    """
+    try:
+        d = _req("GET", f"{base}/blocks?date={date}", cred)
+    except CraftError as e:
+        if e.status == 404 and "dailyNote" in str(e):
+            return []
+        raise
     return d.get("content", []) if isinstance(d, dict) else []
 
 

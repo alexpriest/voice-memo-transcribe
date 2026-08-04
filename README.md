@@ -133,6 +133,37 @@ one. `write_voice_memo` now attaches `toggle_id` to the exception and the error 
 persists it, so the retry *replaces* the partial group. If you add a new failure path between
 toggle creation and completion, it must preserve the toggle id the same way.
 
+## Notifications — one text per memo, sent after the write (fixed 2026-08-03)
+
+A fourth failure mode, worth its own section because the fix constrains where the send may live.
+
+The enrich prompt used to instruct the model to **send the SMS itself**. That made the
+notification a side effect of a step that runs *before* the write and is re-run on every retry.
+When the 2026-08-02 memo's Craft write 404'd, the retry loop texted Alex **four times** — each
+with a different invented title, each flagging the same garbled phrase.
+
+→ `enrich()` now only *returns* `NOTIFY_TEXT`; the prompt tells the model unconditionally not to
+send and not to use tools. `main()` sends via `_send_sms()` **after** `place_in_craft` and
+`append_activity` both succeed, and records `notified` / `notified_at` in the ledger. Every path
+that rewrites a ledger entry — including both error paths — carries `notified` forward, so a memo
+Alex has already been texted about stays quiet across runs, retries, and forced `--uids`
+reprocesses. `--no-notify` gates the send in `main()` and still reports what it would have sent.
+
+**If you add a new notification, put it after the write and give it a ledger flag.** A send that
+happens before the durable write will be re-sent by the retry loop.
+
+**The bar for texting at all is high** (Alex's call, 2026-08-03, after the model flagged a false
+start that changed nothing). `should_notify` is false by default; step 5 of the prompt flips it
+true only for a *load-bearing* unclear span — one that changes what he meant, or garbles a number,
+amount, date, name, or commitment — or a guessed link to someone outside the inner circle. False
+starts, filler, self-corrections and anything obvious from context stay silent: the transcript
+already carries its `[unclear: ...]` markers, so a text is only for what he'd want to know
+**without** opening the note.
+
+Related: `craft_write._blocks()` treats a `404 NOT_FOUND_ERROR / dailyNote` as an empty note
+rather than raising — `POST /blocks` with a `date` position auto-creates the daily note, so a
+missing note was never a real failure. That 404 is what drove the retry loop in the first place.
+
 ## Ops
 
 - Logs: `~/Library/Logs/voice-memo-transcribe.log`

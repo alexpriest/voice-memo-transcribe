@@ -45,9 +45,13 @@ launchd  →  run.sh  →  process_voice_memos.py
 ```
 
 **Division of labor:** Python owns everything deterministic (detection, transcription,
-all file I/O, idempotency). Claude owns only linguistic judgment (cleanup, wikilinks,
-uncertainty) and sends the notification text via the proven `mcp__kit-tools__send_message`
-path. The LLM surface is small and well-defined.
+all file I/O, idempotency, **and sending the notification**). Claude owns only linguistic
+judgment (cleanup, wikilinks, uncertainty) and merely *drafts* the notification text. The
+LLM surface is small and well-defined.
+
+(Claude did send the text itself until 2026-08-03. Because enrichment runs before the write
+and re-runs on every retry, one memo whose Craft write kept 404-ing texted Alex four times.
+See README, "Notifications".)
 
 ## Stage detail
 
@@ -95,9 +99,14 @@ run from the vault dir.
   **Never** change meaning or invent content.
 - Wrap recognized entities in `[[Exact Note Name]]` — **only** names from the supplied list (no red links).
 - Mark genuinely-garbled spans `[unclear: "best guess"]`; suffix a guessed link with `?`.
-- Decide `should_notify` (true only when there's a meaningful uncertainty worth a human glance).
-- If notifying, send a **plain-text** iMessage to **+12702871307** via `mcp__kit-tools__send_message`
-  (no markdown), naming the memo + time + the specific flags.
+- Decide `should_notify`. **False by default** (tightened 2026-08-03 — Alex's call): true only
+  when the unclear span is load-bearing (it changes what he meant) or garbles a number, amount,
+  date, name, or commitment, or when a link was guessed for someone outside the inner circle.
+  False starts, filler, self-corrections, and anything obvious from context are never worth a
+  text — the `[unclear: ...]` markers are already in the note.
+- If notifying, write the **plain-text** SMS (no markdown) naming the memo + time + the specific
+  flags. Claude does NOT send it and uses no tools — stage 4 sends it once the memo is written,
+  and only if the ledger has not already recorded a send for that memo.
 
 **Output:** a single minified JSON object to stdout:
 ```json

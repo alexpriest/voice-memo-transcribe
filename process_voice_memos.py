@@ -333,14 +333,24 @@ Use ONLY names from those lists — never invent a link. Follow the INNER CIRCLE
 people confidently (no "?", no flag) including obvious phonetic manglings. For OTHER people, if a \
 reference is a genuine guess, link it with a trailing "?" and flag it.
 4. Mark any genuinely garbled/unintelligible span as [unclear: "your best guess"].
-5. Decide should_notify: true ONLY if there is a meaningful uncertainty worth Alex's eyes \
-(a garbled word that changes meaning, or a guessed link to a NON-inner-circle person). \
-Inner-circle phonetic resolutions and trivially clean memos => false.
+5. Decide should_notify. It is FALSE by default. Flipping it true takes a specific, nameable \
+consequence of Alex NOT knowing — the bar is "it changes the meaning", nothing softer. The \
+cleaned transcript already carries its [unclear: "..."] markers inline, so he sees every flag the \
+moment he opens the note; a text is only warranted when he would want to know WITHOUT opening it.
+TRUE only when: the unclear span is load-bearing (it changes what he meant), OR it garbles a \
+number, dollar amount, date, name, or commitment, OR you guessed a person/project link for \
+someone OUTSIDE the inner circle.
+FALSE for: false starts, filler, self-corrections, a mumbled aside mid-sentence, an unclear span \
+whose meaning is obvious from the surrounding context, any inner-circle phonetic resolution, and \
+any memo where a phrase was merely hard to hear but nothing turns on it.
+Worked example, NOTIFY: no — a reflective memo transcribes "The call goes according to plan" \
+where he plainly said "if all goes according to plan". It is a false start inside a passage whose \
+meaning is unmistakable, so nothing turns on it. Put it in FLAGS; do not notify.
 6. If notifying, write notify_text: a PLAIN-TEXT SMS (no markdown, no asterisks, under 320 chars) \
 naming the memo title, its time, and the specific flags.
 
-NOTIFY_ENABLED: {notify_enabled}
-{notify_instruction}
+You do NOT send the message — the caller sends it, and only after the memo is safely written. \
+Do NOT use any tools and do NOT write any files; just return the output below.
 
 Never use emojis anywhere — not in the title, the transcript, the flags, or the SMS.
 
@@ -355,28 +365,21 @@ FLAGS: <each flag separated by " | ", or blank if none>
 """
 
 
-def enrich(memo: dict, transcription: dict, entities: str, notify_enabled: bool) -> dict | None:
-    when = memo["recorded"].strftime("%A %-I:%M %p")
-    if notify_enabled:
-        notify_instruction = (
-            f"If should_notify is true, SEND notify_text now via the "
-            f"mcp__kit-tools__send_message tool to {PHONE} (and only that number). "
-            f"Use no other tools and write no files."
-        )
-    else:
-        notify_instruction = (
-            "Do NOT send any message and do NOT use any tools — only return the output "
-            "(still fill NOTIFY_TEXT with what you would have sent)."
-        )
+def enrich(memo: dict, transcription: dict, entities: str) -> dict | None:
+    """Clean, wikilink and title a transcript. Never notifies.
 
+    Enrichment used to send the SMS itself, which made the notification a side effect of a
+    step that runs BEFORE the write and is re-run on every retry: one memo whose Craft write
+    404'd texted Alex four times (2026-08-02). The model now only returns NOTIFY_TEXT; main()
+    sends it once, after the write lands.
+    """
+    when = memo["recorded"].strftime("%A %-I:%M %p")
     prompt = PROMPT_TEMPLATE.format(
         title=memo["title"],
         when=when,
         dur=fmt_duration(memo["duration"]),
         transcript=transcription["annotated"] or transcription["text"],
         entities=entities,
-        notify_enabled=str(notify_enabled).lower(),
-        notify_instruction=notify_instruction,
     )
 
     # Budget scales with the transcript for the same reason the timeout does: the
@@ -639,8 +642,9 @@ def on_call() -> tuple[bool, str]:
 
 
 def _send_sms(text: str) -> bool:
-    """Send a plain-text iMessage to Alex via the vault's kit-tools MCP — the same path
-    enrich() uses to notify. Returns True on success."""
+    """Send a plain-text iMessage to Alex via the vault's kit-tools MCP. The single send
+    path for the whole tool — memo flags, rename nudges, outage nudges. Returns True on
+    success; a False lets the caller leave the ledger un-notified so a later run retries."""
     prompt = (
         f"Use the mcp__kit-tools__send_message tool to send this EXACT text to {PHONE} "
         f"(and only that number). Send it verbatim, use no other tools, and write no files.\n\n"
@@ -651,10 +655,10 @@ def _send_sms(text: str) -> bool:
     try:
         proc = subprocess.run(cmd, cwd=str(VAULT), capture_output=True, text=True, timeout=120)
     except (subprocess.TimeoutExpired, OSError) as e:
-        log(f"rename: notify send error: {e}")
+        log(f"notify: send error: {e}")
         return False
     if proc.returncode != 0:
-        log(f"rename: notify exit {proc.returncode} stderr={proc.stderr[:160]!r}")
+        log(f"notify: exit {proc.returncode} stderr={proc.stderr[:160]!r}")
         return False
     return True
 
@@ -988,7 +992,7 @@ def retitle_all(args) -> int:
                 log(f"  no real speech ({len(spoken)} chars) — keeping {title!r}")
                 enriched = None
             else:
-                enriched = None if args.raw else enrich(m, tr, "", notify_enabled=False)
+                enriched = None if args.raw else enrich(m, tr, "")
                 title = ((enriched or {}).get("title") or "").strip()
             if not title:
                 # No enrichment: fall back to the transcript's opening words, which still
@@ -1127,14 +1131,19 @@ def main() -> int:
             log(f"  skip (still syncing after {READY_WAIT_TIMEOUT_S}s): {m['title']}")
             continue
         log(f"→ {m['title']} ({fmt_duration(m['duration'])}, {m['recorded']:%Y-%m-%d %H:%M})")
+        prev = ledger.get(m["uid"]) or {}
+        # Carried through every path below, including the error ones: a memo Alex has already
+        # been texted about must never be texted about again, however many retries it takes.
+        notified = bool(prev.get("notified"))
+        notified_at = prev.get("notified_at")
 
         try:
             tr = transcribe(m["audio"])
         except Exception as e:  # noqa: BLE001 - never let one memo kill the run
             log(f"  transcribe error: {e}")
-            prev = ledger.get(m["uid"]) or {}
             ledger[m["uid"]] = {"status": "error", "error": str(e)[:200],
                                 "attempts": int(prev.get("attempts") or 0) + 1,
+                                "notified": notified, "notified_at": notified_at,
                                 "at": datetime.now().isoformat(timespec="seconds")}
             save_ledger(ledger)
             continue
@@ -1146,7 +1155,7 @@ def main() -> int:
         if args.raw:
             body = tr["text"]
         else:
-            enriched = enrich(m, tr, entities, notify_enabled)
+            enriched = enrich(m, tr, entities)
             if enriched:
                 body = enriched.get("cleaned_markdown") or tr["text"]
                 clever_title = (enriched.get("title") or "").strip() or m["title"]
@@ -1187,7 +1196,7 @@ def main() -> int:
             if DEST == "craft":
                 craft_toggle_id = place_in_craft(
                     m, body, uncertainties, clever_title,
-                    prev_toggle_id=(ledger.get(m["uid"]) or {}).get("craft_toggle_id"),
+                    prev_toggle_id=prev.get("craft_toggle_id"),
                 )
                 note_ref = f"Craft/Daily Notes/{m['recorded']:%Y/%m-%B/%Y-%m-%d} (toggle)"
             else:
@@ -1199,7 +1208,6 @@ def main() -> int:
             append_activity(m, uncertainties, clever_title)
         except Exception as e:  # noqa: BLE001 - never let one memo kill the run
             log(f"  write error: {e}")
-            prev = ledger.get(m["uid"]) or {}
             ledger[m["uid"]] = {"status": "error", "error": str(e)[:200],
                                 "orig_title": m["title"],
                                 "attempts": int(prev.get("attempts") or 0) + 1,
@@ -1207,10 +1215,31 @@ def main() -> int:
                                 # replace the partial group instead of duplicating it.
                                 "craft_toggle_id": getattr(e, "toggle_id", None)
                                                    or prev.get("craft_toggle_id"),
+                                "notified": notified, "notified_at": notified_at,
                                 "recorded": m["recorded"].isoformat(timespec="seconds"),
                                 "processed_at": datetime.now().isoformat(timespec="seconds")}
             save_ledger(ledger)
             continue
+
+        # Notify LAST — the memo is on the page and in the activity log by now. Enrichment
+        # used to send this itself, before the write and again on every retry, so a memo the
+        # Craft write kept 404-ing on texted Alex once per attempt (2026-08-02: four messages,
+        # four invented titles, one memo). One send per memo, recorded in the ledger.
+        if not should_notify:
+            notify_note = ""
+        elif notified:
+            notify_note = " · already texted (skipped)"
+        elif not notify_enabled:
+            notify_note = f" · WOULD text: {notify_text!r}"
+        elif not notify_text.strip():
+            notify_note = " · flagged but no notify text — nothing sent"
+        elif _send_sms(notify_text):
+            notified = True
+            notified_at = datetime.now().isoformat(timespec="seconds")
+            notify_note = " · texted Alex"
+        else:
+            notify_note = " · notify send FAILED"
+
         # app rename is handled asynchronously by the --rename-queue runner when the
         # screen is unlocked and idle (see rename_queue); transcription never touches the UI.
         ledger[m["uid"]] = {
@@ -1222,13 +1251,12 @@ def main() -> int:
             "app_renamed": False,
             "craft_toggle_id": craft_toggle_id,
             "flags": uncertainties,
+            "notified": notified,
+            "notified_at": notified_at,
             "processed_at": datetime.now().isoformat(timespec="seconds"),
         }
         save_ledger(ledger)
         flag_note = f" · {len(uncertainties)} flag(s)" if uncertainties else ""
-        notify_note = " · texted Alex" if (should_notify and notify_enabled and not args.raw) else (
-            f" · WOULD text: {notify_text!r}" if should_notify else ""
-        )
         log(f"  ✓ → {note_ref}{flag_note}{notify_note}")
 
     return 0

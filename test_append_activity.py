@@ -1,17 +1,23 @@
-"""An LLM-generated memo title must not be able to forge an activity-log bullet.
+"""Two invariants of the memo pipeline.
 
-append_activity() interpolates the Claude-written title into a "- HH:MM
-[voice-memos] ..." bullet in the shared Activity Log. Readers harvest every
-line starting with "- " straight into an LLM system prompt, so a newline in the
-title (whose content derives from the untrusted transcript) is a
-prompt-injection primitive.
+1. An LLM-generated memo title must not be able to forge an activity-log bullet.
+   append_activity() interpolates the Claude-written title into a "- HH:MM
+   [voice-memos] ..." bullet in the shared Activity Log. Readers harvest every
+   line starting with "- " straight into an LLM system prompt, so a newline in
+   the title (whose content derives from the untrusted transcript) is a
+   prompt-injection primitive.
+
+2. One memo texts Alex at most once, and only once it is safely written.
 
 Run:
     /opt/homebrew/bin/python3.11 -m pytest test_append_activity.py
 (any python3.11+ with pytest works — imports are stdlib-only)
 """
 
+import sys
 from datetime import datetime
+
+import pytest
 
 import process_voice_memos as pvm
 
@@ -159,3 +165,162 @@ def test_canonical_spec_vectors():
     assert len(SPEC_VECTORS) == 48
     for given, want in SPEC_VECTORS:
         assert sanitize(given) == want, f"vector {given!r}"
+
+
+# --------------------------------------------------------------------------- #
+# Notification: exactly once per memo, and only after the write landed.
+#
+# Regression for 2026-08-02: enrich() sent the SMS itself, before place_in_craft
+# and again on every retry. One memo whose Craft write 404'd ("Daily note for
+# date 2026.08.02 does not exist") burned all five retries and texted Alex four
+# separate times, each with a different invented title.
+# --------------------------------------------------------------------------- #
+
+class _Harness:
+    """Drive main() over one fake memo with every side effect stubbed."""
+
+    def __init__(self, monkeypatch, tmp_path):
+        self._monkeypatch = monkeypatch
+        self.ledger_path = tmp_path / "processed.json"
+        self.sent: list[str] = []
+        self.writes = 0
+        self.place_error: Exception | None = None
+
+        monkeypatch.setattr(pvm, "LEDGER_PATH", self.ledger_path)
+        monkeypatch.setattr(pvm, "ACTIVITY_DIR", tmp_path / "activity")
+        monkeypatch.setattr(pvm, "FATAL_NOTIFY_PATH", tmp_path / "fatal_notify.json")
+        monkeypatch.setattr(pvm, "DEST", "craft")
+        monkeypatch.setattr(pvm, "query_memos", lambda *a, **k: [dict(self.memo)])
+        monkeypatch.setattr(pvm, "wait_until_ready", lambda *a, **k: True)
+        monkeypatch.setattr(pvm, "build_entities", lambda: "")
+        monkeypatch.setattr(pvm, "transcribe", lambda audio: {
+            "text": "raw text", "annotated": "raw text", "shaky": []})
+        monkeypatch.setattr(pvm, "enrich", lambda *a, **k: {
+            "title": "Steck Ave errand list",
+            "cleaned_markdown": "Cleaned body.",
+            "uncertainties": ['garbled: "stec"'],
+            "should_notify": True,
+            "notify_text": "Voice memo at 2:13 PM has one garbled word.",
+        })
+        monkeypatch.setattr(pvm, "place_in_craft", self._place)
+        monkeypatch.setattr(pvm, "_send_sms", self._send)
+
+    memo = {
+        "uid": "34AC8047-4EB2-4EB5-B255-8E0C3581BB7C",
+        "title": "Steck Ave",
+        "recorded": datetime(2026, 8, 2, 14, 13, 21),
+        "duration": 65.0,
+        "audio": "/nonexistent/memo.m4a",
+    }
+
+    def _place(self, *a, **k):
+        if self.place_error is not None:
+            raise self.place_error
+        self.writes += 1
+        return "toggle-1"
+
+    def _send(self, text: str) -> bool:
+        self.sent.append(text)
+        return True
+
+    def run(self, *argv: str) -> dict:
+        self._monkeypatch.setattr(sys, "argv", ["process_voice_memos.py", *argv])
+        assert pvm.main() == 0
+        return pvm.load_ledger()
+
+    @property
+    def entry(self) -> dict:
+        return pvm.load_ledger()[self.memo["uid"]]
+
+
+@pytest.fixture
+def harness(tmp_path, monkeypatch):
+    return _Harness(monkeypatch, tmp_path)
+
+
+def test_enrich_never_sends_the_message_itself():
+    """The prompt must not hand the model the send tool — that was the bug."""
+    assert "send_message" not in pvm.PROMPT_TEMPLATE
+    assert "You do NOT send the message" in pvm.PROMPT_TEMPLATE
+
+
+def test_prompt_encodes_the_stricter_notify_bar():
+    """Alex's call, 2026-08-03: notify only if the unclear span changes the meaning.
+
+    The model had been firing on a false start ("The call goes according to plan", a
+    mis-hearing of "if all goes according to plan") that changed nothing.
+    """
+    step5 = pvm.PROMPT_TEMPLATE.split("5. Decide should_notify")[1].split("6. If notifying")[0]
+
+    assert "FALSE by default" in step5
+    assert "load-bearing" in step5
+    assert "changes the meaning" in step5
+    # the exclusions Alex named — silence on anything nothing turns on
+    for excluded in ("false starts", "filler", "self-corrections", "mumbled aside",
+                     "obvious from the surrounding context", "inner-circle phonetic resolution"):
+        assert excluded in step5, excluded
+    # and a concrete anchor for the "obvious from context" case
+    assert "goes according to plan" in step5
+    assert "NOTIFY: no" in step5
+
+
+def test_successful_memo_notifies_exactly_once(harness):
+    harness.run()
+
+    assert harness.sent == ["Voice memo at 2:13 PM has one garbled word."]
+    assert harness.entry["status"] == "done"
+    assert harness.entry["notified"] is True
+    assert harness.entry["notified_at"]
+
+
+def test_failed_write_is_not_notified(harness):
+    harness.place_error = RuntimeError(
+        'GET /blocks -> 404: {"error":"Daily note for date 2026.08.02 does not exist"}')
+
+    harness.run()
+
+    assert harness.sent == []
+    assert harness.entry["status"] == "error"
+    assert harness.entry["attempts"] == 1
+    assert not harness.entry["notified"]
+
+
+def test_notified_memo_is_never_notified_again(harness):
+    harness.run()
+    assert len(harness.sent) == 1
+
+    harness.run("--uids", harness.memo["uid"])  # forced reprocess, ledger says done
+
+    assert harness.writes == 2  # it really did run again
+    assert len(harness.sent) == 1  # but stayed quiet
+
+
+def test_retry_after_a_failed_write_texts_once_not_once_per_attempt(harness):
+    """The 2026-08-02 storm, replayed: three failures then a success = one text."""
+    harness.place_error = RuntimeError("Daily note for date 2026.08.02 does not exist")
+    for _ in range(3):
+        harness.run()
+    assert harness.sent == []
+    assert harness.entry["attempts"] == 3
+
+    harness.place_error = None
+    harness.run()
+    harness.run("--uids", harness.memo["uid"])
+
+    assert len(harness.sent) == 1
+
+
+def test_no_notify_reports_without_sending(harness):
+    harness.run("--no-notify")
+
+    assert harness.sent == []
+    assert harness.entry["status"] == "done"  # the memo still landed
+    assert harness.entry["notified"] is False  # so a later run may still text
+
+
+def test_dry_run_writes_nothing_and_sends_nothing(harness):
+    harness.run("--dry-run")
+
+    assert harness.sent == []
+    assert harness.writes == 0
+    assert not harness.ledger_path.exists()
