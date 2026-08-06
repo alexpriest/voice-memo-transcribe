@@ -1034,12 +1034,66 @@ def clear_fatal_notify() -> None:
 # ---------------------------------------------------------------------------- #
 # Main
 # ---------------------------------------------------------------------------- #
+def record_error(ledger: dict, m: dict, prev: dict, message: str, *,
+                 notify_enabled: bool, extra: dict | None = None) -> None:
+    """Ledger a failed memo, and text Alex exactly once if this is the attempt we give up on.
+
+    2026-08-06: a per-memo failure used to be completely silent. `notified` only ever flips
+    true on SUCCESS, so after MAX_ERROR_RETRIES the entry was skipped forever and the log
+    printed 'nothing new to process' — byte-identical to a quiet day. A broken ffmpeg
+    (homebrew bumped x265 out from under it) killed the 2026-08-05 memo that way and it was
+    only recovered because Alex happened to ask. The whole point of this tool is that a
+    thought he had in the car survives; abandoning one without telling him is the single
+    worst thing it can do.
+
+    Deliberately a SEPARATE key from `notified`. That flag is the content notification the
+    enrichment step asks for; overloading it would mean a give-up text suppresses a later
+    content text, or vice versa. Two different questions, two different flags.
+
+    Still one text per memo, not one per attempt — the bar Alex set stays where it is. Only
+    the terminal attempt notifies, and only once.
+    """
+    attempts = int(prev.get("attempts") or 0) + 1
+    gave_up = attempts >= MAX_ERROR_RETRIES
+    gave_up_notified = bool(prev.get("gave_up_notified"))
+
+    if gave_up and not gave_up_notified:
+        when = m["recorded"].strftime("%-m/%-d %-I:%M%p")
+        text = (
+            f"Voice memo from {when} ({fmt_duration(m['duration'])}) failed to process "
+            f"{attempts} times and I've stopped retrying it. The recording is safe in Voice "
+            f"Memos, but nothing was written to your daily note. Error: {message[:140]}"
+        )
+        if not notify_enabled:
+            log(f"  gave up after {attempts} attempts · WOULD text: {text!r}")
+        elif _send_sms(text):
+            gave_up_notified = True
+            log(f"  gave up after {attempts} attempts · texted Alex")
+        else:
+            log(f"  gave up after {attempts} attempts · notify send FAILED")
+
+    entry = {
+        "status": "error",
+        "error": message[:200],
+        "attempts": attempts,
+        "gave_up": gave_up,
+        "gave_up_notified": gave_up_notified,
+        "notified": bool(prev.get("notified")),
+        "notified_at": prev.get("notified_at"),
+        "at": datetime.now().isoformat(timespec="seconds"),
+    }
+    entry.update(extra or {})
+    ledger[m["uid"]] = entry
+    save_ledger(ledger)
+
+
 def select_memos(memos: list[dict], ledger: dict, args) -> list[dict]:
     if args.uids:
         wanted = {u.strip() for u in args.uids.split(",") if u.strip()}
         out = [m for m in memos if m["uid"] in wanted]  # forced, ignore ledger status
         return out[: args.limit] if args.limit else out
     out = []
+    abandoned = []
     for m in memos:
         entry = ledger.get(m["uid"])
         if args.backfill_since:
@@ -1055,10 +1109,19 @@ def select_memos(memos: list[dict], ledger: dict, args) -> list[dict]:
             # permanently orphaned a memo that had already cost a full transcribe.
             if entry is not None and entry.get("status") == "error":
                 if int(entry.get("attempts") or 0) >= MAX_ERROR_RETRIES:
+                    abandoned.append(m)
                     continue
             elif entry is not None:  # seeded or done => skip
                 continue
         out.append(m)
+    # Say it out loud on every run. A permanently-abandoned memo used to be invisible here:
+    # the run log said 'nothing new to process', which is exactly what a quiet day says.
+    # One line costs nothing and makes the two states distinguishable at a glance.
+    for m in abandoned:
+        e = ledger.get(m["uid"], {})
+        log(f"  ⚠ abandoned after {e.get('attempts')} attempts: {m['title']} "
+            f"({m['recorded']:%Y-%m-%d %H:%M}) — {str(e.get('error'))[:100]} "
+            f"[retry: run.sh --uids {m['uid']}]")
     if args.limit:
         out = out[: args.limit]
     return out
@@ -1141,11 +1204,9 @@ def main() -> int:
             tr = transcribe(m["audio"])
         except Exception as e:  # noqa: BLE001 - never let one memo kill the run
             log(f"  transcribe error: {e}")
-            ledger[m["uid"]] = {"status": "error", "error": str(e)[:200],
-                                "attempts": int(prev.get("attempts") or 0) + 1,
-                                "notified": notified, "notified_at": notified_at,
-                                "at": datetime.now().isoformat(timespec="seconds")}
-            save_ledger(ledger)
+            record_error(ledger, m, prev, str(e), notify_enabled=notify_enabled,
+                         extra={"orig_title": m["title"],
+                                "recorded": m["recorded"].isoformat(timespec="seconds")})
             continue
 
         uncertainties: list[str] = []
@@ -1208,17 +1269,14 @@ def main() -> int:
             append_activity(m, uncertainties, clever_title)
         except Exception as e:  # noqa: BLE001 - never let one memo kill the run
             log(f"  write error: {e}")
-            ledger[m["uid"]] = {"status": "error", "error": str(e)[:200],
-                                "orig_title": m["title"],
-                                "attempts": int(prev.get("attempts") or 0) + 1,
+            record_error(ledger, m, prev, str(e), notify_enabled=notify_enabled,
+                         extra={"orig_title": m["title"],
                                 # Set when the toggle was already created — lets the retry
                                 # replace the partial group instead of duplicating it.
                                 "craft_toggle_id": getattr(e, "toggle_id", None)
                                                    or prev.get("craft_toggle_id"),
-                                "notified": notified, "notified_at": notified_at,
                                 "recorded": m["recorded"].isoformat(timespec="seconds"),
-                                "processed_at": datetime.now().isoformat(timespec="seconds")}
-            save_ledger(ledger)
+                                "processed_at": datetime.now().isoformat(timespec="seconds")})
             continue
 
         # Notify LAST — the memo is on the page and in the activity log by now. Enrichment
