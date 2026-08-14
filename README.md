@@ -100,6 +100,58 @@ open: a broken notifier logs and gets out of the way rather than becoming a seco
 Creates the venv, installs mlx-whisper, pre-downloads the model, loads the launchd agent, and
 adds the audio folder to the vault `.gitignore`.
 
+## The Apple layer was silently load-bearing (fixed 2026-08-14, ANT-461)
+
+**This is the first failure that was not in our code, and it is the worst one, because
+everything downstream reported healthy the entire time.**
+
+On 2026-08-14 Alex asked about a memo he had recorded on 8/13. It had never been
+transcribed — and neither had one from 8/11. Both were sitting fully uploaded in iCloud.
+Neither had ever reached this Mac.
+
+**Root cause: nothing on this machine was pulling.** `voicememod` is the macOS daemon that
+syncs Voice Memos from CloudKit into `CloudRecordings.db`, and
+`/System/Library/LaunchAgents/com.apple.voicememod.plist` has **no `RunAtLoad` and no
+`KeepAlive`**. It sets `EnablePressuredExit` and `EnableTransactions`, and its only launch
+triggers are its MachServices: `com.apple.aps.voicememod` (the APNs push) and
+`com.apple.voicememod.datastore.Cloud` / `.xpc` (the Voice Memos app). Alex never opens
+Voice Memos on the Mini. So the whole pipeline hung off a single push arriving and being
+acted on — **with no retry of any kind.** Miss one and every later memo is stranded
+indefinitely.
+
+⚠️ **"voicememod is not running" is NOT itself the bug** — idle exit is by design. The bug
+is that nothing ever wakes it again. Do not "fix" this by trying to keep it alive.
+
+**Why five days passed unnoticed.** `query_memos()` read the DB perfectly; it was the *DB*
+that was frozen. So the poll logged `33 eligible memos in DB / nothing new to process`
+**235 consecutive times**, which is byte-identical to a quiet week. The FDA silent-failure
+guard never fired because nothing failed. The only physical tell was
+`CloudRecordings.db-wal` frozen at 2026-08-08 20:41 — the timestamp of *our own renamer's*
+write, i.e. the last thing to touch that database was us, not Apple.
+
+**The fix: stop trusting the push, pull on every poll.** `kick_icloud_sync()` runs
+`launchctl kickstart gui/<uid>/com.apple.voicememod` immediately before the existing
+`SETTLE_SECONDS` sleep, so the CloudKit fetch lands inside a window we were already paying
+for. Measured: two stranded memos finished downloading ~26s after the kickstart, which is
+why `SETTLE_SECONDS` went 25 → 35.
+
+- **Plain `kickstart`, never `-k`.** Verified idempotent on a running job (exit 0, PID
+  unchanged). `-k` would kill a possibly mid-download daemon to cover a failure mode there
+  is no evidence of.
+- **Best effort, never fatal.** This runs before every poll, so if it could raise it would
+  turn a partial outage into a total one. That invariant is the load-bearing test in
+  `test_icloud_sync.py`.
+- **`--rename-queue` kicks too, after its writes.** A title only reaches Alex's iPhone when
+  voicememod exports our Core Data persistent-history transaction to CloudKit, so the same
+  dead daemon breaks *both* halves — memos stranded coming in, titles stranded going out.
+- **The poll now logs the newest memo's date, not just the count.** A count says nothing
+  about whether the DB is live or frozen; a newest-date that stops advancing is obvious.
+- **`voicememod was DOWN — revived it`** is logged only when we actually revived it. How
+  often that line appears is the only data anyone will have if this recurs.
+
+Verified end-to-end through launchd and the Agent Tools wrapper, not from a shell: killed
+voicememod, ran the job, watched it log the revival and bring the daemon back.
+
 ## Reliability — three failure modes, all fixed 2026-07-30
 
 A single memo (2026-07-30) tripped all three in sequence. Worth understanding before touching

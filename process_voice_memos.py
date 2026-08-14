@@ -50,7 +50,11 @@ LOCK_PATH = TOOL_DIR / "state" / ".lock"
 RENAME_NOTIFY_PATH = TOOL_DIR / "state" / "rename_notify.json"  # backlog-nudge dedupe state
 FATAL_NOTIFY_PATH = TOOL_DIR / "state" / "fatal_notify.json"  # outage-nudge dedupe state
 CALLGUARD_BIN = TOOL_DIR / "bin" / "callguard"  # camera/mic-in-use probe (see bin/callguard.swift)
-SETTLE_SECONDS = 25  # let recording / iCloud writes finish before reading the container
+# Doubles as the window for the kick_icloud_sync() CloudKit fetch to land. Measured
+# 2026-08-14: two stranded memos finished downloading ~26s after the kickstart, so 25
+# was a coin flip. A late arrival still self-corrects — the download touches the
+# Recordings dir, which is a WatchPath — but landing it on the first pass is cheaper.
+SETTLE_SECONDS = 35  # let recording / iCloud writes finish before reading the container
 AUDIO_DEST = VAULT / "System" / "Voice Memos" / "Audio"
 DAILY_DIR = VAULT / "Daily"
 ACTIVITY_DIR = VAULT / "Claude" / "System" / "Activity"
@@ -145,6 +149,65 @@ def save_ledger(ledger: dict) -> None:
 # ---------------------------------------------------------------------------- #
 # Detect
 # ---------------------------------------------------------------------------- #
+def kick_icloud_sync() -> bool:
+    """Wake `voicememod` so memos recorded on the iPhone actually reach this Mac.
+
+    macOS launches voicememod ON DEMAND ONLY. /System/Library/LaunchAgents/
+    com.apple.voicememod.plist has **no RunAtLoad and no KeepAlive**, sets
+    EnablePressuredExit, and is triggered solely by its MachServices: the APNs
+    push (com.apple.aps.voicememod) and the Voice Memos app itself. Alex never
+    opens that app on the Mini, so the whole pipeline hangs off one push
+    arriving and being acted on — and **there is no retry**. Miss it and every
+    later memo sits in iCloud indefinitely.
+
+    That is not hypothetical. On 2026-08-14 two memos (recorded 8/11 and 8/13)
+    had never reached the Mac; CloudRecordings.db-wal had not been touched since
+    8/08 20:41, which is *our own renamer's* write. Both downloaded within ~25s
+    of a kickstart. Meanwhile this script read the DB fine and logged
+    "33 eligible memos in DB / nothing new to process" for 235 consecutive
+    polls, which is byte-identical to a quiet week — so the FDA failure guard
+    never fired and nothing looked wrong.
+
+    So: stop trusting Apple's push and pull on every poll instead. Plain
+    `kickstart` (never `-k`) is an idempotent no-op when the daemon is already
+    up — verified: exit 0, PID unchanged — and a fresh launch performs a
+    CloudKit fetch. `-k` is deliberately NOT used: it would kill a possibly
+    mid-download daemon to cover a failure mode we have no evidence of.
+
+    Best effort by design. A failure here must never take down the run — the
+    worst case is what we already had before this function existed.
+    """
+    label = f"gui/{os.getuid()}/com.apple.voicememod"
+    # Cheap pre-check purely so the log can distinguish "no-op, it was already up"
+    # from "it was DEAD and we just revived it". The second line is the one worth
+    # seeing: it is the outage, and how often it appears is the only data anyone
+    # will have if this recurs. pgrep, not `launchctl print` parsing — the state
+    # only feeds a log message, so it must never be able to change behaviour.
+    was_down = False
+    try:
+        was_down = subprocess.run(
+            ["pgrep", "-x", "voicememod"], capture_output=True, timeout=10
+        ).returncode != 0
+    except Exception:
+        pass  # unknowable is fine; the kickstart below is unconditional either way
+
+    try:
+        proc = subprocess.run(
+            ["launchctl", "kickstart", label],
+            capture_output=True, text=True, timeout=20,
+        )
+    except Exception as exc:  # OSError, TimeoutExpired, anything — never fatal
+        log(f"WARN could not wake voicememod ({exc}) — reading whatever already synced")
+        return False
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[:120]
+        log(f"WARN voicememod kickstart rc={proc.returncode} {detail} — reading whatever already synced")
+        return False
+    if was_down:
+        log("voicememod was DOWN — revived it; new memos should land in this pass")
+    return True
+
+
 def query_memos(min_duration: float = MIN_DURATION_S) -> list[dict]:
     """Copy the live DB (+wal/+shm) to temp and read it read-only."""
     if not DB_PATH.exists():
@@ -758,6 +821,14 @@ def rename_queue(args) -> int:
         else:
             log(f"rename: {uid[:8]} saved but DB shows {fresh.get(uid)!r} — leaving pending")
     save_ledger(ledger)
+    # A title only reaches Alex's iPhone when voicememod exports our Core Data
+    # persistent-history transaction to CloudKit. Same on-demand daemon as the
+    # download path, so the same outage breaks BOTH halves: during 8/08-8/14 the
+    # memos were stranded in iCloud *and* any title we wrote would have sat
+    # unexported. Kick AFTER the writes — the transaction has to exist first —
+    # and only when we actually wrote something.
+    if done:
+        kick_icloud_sync()
     log(f"rename: pass done, {done} applied")
     return 0
 
@@ -1162,12 +1233,23 @@ def main() -> int:
         if active:
             log(f"{why} — on a call, deferring (next memo or the 06:30 catch-up retries)")
             return 0
+        # Kick BEFORE the settle sleep so the CloudKit fetch lands inside a window
+        # we were already paying for. Anything that arrives late also re-fires this
+        # job on its own: the download touches the Recordings dir, which is a
+        # WatchPath. See kick_icloud_sync() for why this is not optional.
+        kick_icloud_sync()
         time.sleep(SETTLE_SECONDS)
 
     ledger = load_ledger()
     memos = query_memos()
     clear_fatal_notify()  # DB read worked — any prior outage is over
-    log(f"{len(memos)} eligible memos in DB")
+    # Log the newest memo's DATE, not just the count. A bare count is the reason the
+    # 8/08-8/14 sync outage read as healthy for five days: "33 eligible" says nothing
+    # about whether the DB is live or frozen, but a newest-date that stops advancing
+    # is visible at a glance.
+    newest = max((m["recorded"] for m in memos), default=None)
+    stamp = f", newest {newest:%Y-%m-%d %H:%M}" if newest else ""
+    log(f"{len(memos)} eligible memos in DB{stamp}")
 
     if args.seed_ledger:
         seeded = 0
