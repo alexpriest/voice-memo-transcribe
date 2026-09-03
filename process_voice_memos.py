@@ -33,6 +33,8 @@ import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 
+import asks  # callout dispatch (ANT-757): routes "Kit, …" / "tell Iris…" asks
+
 # ---------------------------------------------------------------------------- #
 # Config
 # ---------------------------------------------------------------------------- #
@@ -918,6 +920,21 @@ def append_activity(memo: dict, flags: list[str], title: str) -> None:
         f.write(line)
 
 
+def append_activity_line(summary: str) -> None:
+    """One extra `[voice-memos]` bullet (used for callout dispatch). Same file, same
+    sanitizer, same one-line guarantee as append_activity."""
+    now = datetime.now()
+    path = ACTIVITY_DIR / f"{now:%Y-%m-%d} Activity Log.md"
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"---\ncreated: '[[{now:%Y-%m-%d}]]'\ntags: activity-log\n---\n"
+            f"# Activity Log — {now:%Y-%m-%d}\n\n"
+        )
+    with path.open("a") as f:
+        f.write(f"- {now:%H:%M} [voice-memos] {sanitize_log_text(summary)}\n")
+
+
 # ---------------------------------------------------------------------------- #
 # Failure guard
 # ---------------------------------------------------------------------------- #
@@ -1326,6 +1343,9 @@ def main() -> int:
                 log("  [dry-run] would write callout:")
                 print(build_callout(m, "AUDIO.m4a", body, uncertainties, clever_title))
             log(f"  [dry-run] should_notify={should_notify} notify_text={notify_text!r}")
+            if not args.raw:
+                asks.run(m, body, clever_title, None, prev, date=f"{m['recorded']:%Y-%m-%d}",
+                         dry_run=True, notify_enabled=notify_enabled, send_sms=_send_sms)
             continue
 
         # Same protection the transcribe step already has, for the same reason:
@@ -1361,6 +1381,19 @@ def main() -> int:
                                 "processed_at": datetime.now().isoformat(timespec="seconds")})
             continue
 
+        # Callout dispatch — runs only once the memo is safely on the page (so a retry after
+        # a write failure never dispatches twice; asks.run also checks the ledger itself).
+        # Never raises; a miss here still reaches the persona via its inbox file later.
+        asks_fields: dict = {}
+        if not args.raw:
+            asks_fields = asks.run(
+                m, body, clever_title, craft_toggle_id, prev,
+                date=f"{m['recorded']:%Y-%m-%d}", dry_run=False,
+                notify_enabled=notify_enabled, send_sms=_send_sms,
+            )
+            if asks_fields.get("asks"):
+                append_activity_line(asks.summary_line(clever_title, asks_fields["asks"]))
+
         # Notify LAST — the memo is on the page and in the activity log by now. Enrichment
         # used to send this itself, before the write and again on every retry, so a memo the
         # Craft write kept 404-ing on texted Alex once per attempt (2026-08-02: four messages,
@@ -1394,6 +1427,7 @@ def main() -> int:
             "notified": notified,
             "notified_at": notified_at,
             "processed_at": datetime.now().isoformat(timespec="seconds"),
+            **asks_fields,
         }
         save_ledger(ledger)
         flag_note = f" · {len(uncertainties)} flag(s)" if uncertainties else ""

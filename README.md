@@ -23,6 +23,29 @@ both `.m4a` and `.qta` (QuickTime-audio; Voice Memos uses it for some recordings
 pre-seed `.qta` memos were seeded-as-ignored on 2026-07-08 when `.qta` support was added, so
 the filter only affects memos going forward.
 
+## Callout dispatch — "Kit, remind me…" / "tell Iris…" (ANT-757, 2026-09-03)
+
+`asks.py` runs right after a memo is written to Craft. One Sonnet call reads the cleaned
+transcript for asks Alex addresses **to an agent by name** (Kit, Iris, Ansel, Mateo, Asa, Wren,
+Paloma, Juno); passing mentions and self-talk are deliberately not asks. Each ask becomes a
+checkbox at the end of his Craft daily note, and then:
+
+- **Kit** — the checkbox carries `#kit`; `kit-watch` (launchd, 5 min) dispatches the headless Kit
+  worker, which answers under the block and swaps in `#review`. Nothing new to run for Kit.
+- **A persona** — an entry in `Claude/<Folder>/Inboxes/<name>.md` (quote + memo ref, via
+  `vault-append`), the checkbox marked `→ Name`, and a detached `claude --agent <name> -p` run from
+  the persona's folder (`state/dispatch.log`), briefed to answer under the block and `craft tag
+  <id> review`. If the run dies, the inbox entry still reaches the persona at its next session.
+- **Iris** runs unattended (Alex, 9/03) but is sealed: the activity line and the SMS carry a count
+  for her, never the ask text.
+
+One text per memo, only when ≥1 ask was heard, deduped by `asks_notified` in the ledger; the
+whole pass is skipped on a retry once `asks_dispatched` is set. Every failure is logged and
+swallowed — the memo is already on the page. Check extraction on a saved transcript with no side
+effects: `.venv/bin/python3.11 asks.py --file /tmp/memo.txt`. Tests: `test_asks.py`
+(`/opt/homebrew/bin/python3.11 -m pytest -q`; `conftest.py` stubs every side effect for the
+whole suite).
+
 ## App rename runner (Core Data write — the 2026-07-23 rewrite)
 
 Apple exposes no rename API, so this used to drive the **File → Rename** UI via
