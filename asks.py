@@ -43,6 +43,7 @@ TOOL_DIR = Path(__file__).resolve().parent
 DISPATCH_LOG = TOOL_DIR / "state" / "dispatch.log"
 CLAUDE_BIN = str(HOME / ".local" / "bin" / "claude")
 EXTRACT_MODEL = "claude-sonnet-4-6"
+EXTRACT_SYSTEM = "You read transcripts of Alex Priest's voice memos and extract the asks he addresses to his agents by name. Output exactly the layout requested, nothing else."
 VAULT_APPEND = str(HOME / ".local" / "bin" / "vault-append")
 PERSONA_PATH = "/Users/alex/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 PERSONA_BUDGET_USD = "10.00"
@@ -179,10 +180,14 @@ def extract_asks(memo: dict, body: str) -> list[dict]:
         roster=_roster(),
         transcript=body,
     )
-    cmd = [CLAUDE_BIN, "-p", "--permission-mode", "bypassPermissions",
-           "--model", EXTRACT_MODEL, "--max-budget-usd", "0.40", prompt]
+    # ANT-764: --restricted + --strict-mcp-config + --system-prompt + --tools "" — no settings files, no
+    # MCP servers, no Claude Code system prompt, and not the vault cwd (its CLAUDE.md tree loads too).
+    # Measured 2026-09-04 on a trivial prompt: the old shape was ~122k input tokens ($0.73 uncached, and
+    # launchd is always uncached); this shape is a few hundred. The extraction never uses a tool.
+    cmd = [CLAUDE_BIN, "-p", "--restricted", "--strict-mcp-config", "--system-prompt", EXTRACT_SYSTEM,
+           "--model", EXTRACT_MODEL, "--max-budget-usd", "0.40", "--permission-mode", "dontAsk", "--tools", ""]
     try:
-        proc = subprocess.run(cmd, cwd=str(VAULT), capture_output=True, text=True, timeout=240)
+        proc = subprocess.run(cmd, input=prompt, cwd=str(TOOL_DIR), capture_output=True, text=True, timeout=240)
     except (subprocess.TimeoutExpired, OSError) as e:
         log(f"extract error: {e}")
         return []

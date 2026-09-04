@@ -19,6 +19,8 @@ import pytest
 
 import asks
 
+REAL_EXTRACT = asks.extract_asks  # captured at import, before conftest stubs it
+
 MEMO = {"uid": "U1", "title": "New Recording 7", "duration": 461.0,
         "recorded": datetime(2026, 9, 2, 15, 9)}
 TITLE = "Birthday spa day and Austin's missing luxury retreat"
@@ -134,3 +136,24 @@ def test_untrusted_text_cannot_forge_headers_or_bullets():
     assert not any(ln.startswith("- ") for ln in lines)
     task = asks.task_markdown(ask)
     assert "\n" not in task
+
+
+def test_extract_runs_claude_without_mcp_schemas_or_settings(monkeypatch):
+    """ANT-764: a default `claude -p` carries ~121k tokens of MCP tool schemas ($0.73 uncached) that a
+    tool-less extraction never uses. The call must be restricted, MCP-free, and carry its own system prompt."""
+    seen = {}
+
+    class R:
+        returncode, stdout, stderr = 0, "NONE", ""
+
+    def fake_run(cmd, **kw):
+        seen["cmd"], seen["kw"] = cmd, kw
+        return R()
+    monkeypatch.setattr(asks.subprocess, "run", fake_run)
+    assert REAL_EXTRACT(MEMO, "Kit, remind me to call Jack.") == []
+    cmd = seen["cmd"]
+    assert "--restricted" in cmd and "--strict-mcp-config" in cmd and "--system-prompt" in cmd
+    assert "--tools" in cmd and cmd[cmd.index("--tools") + 1] == ""
+    assert "bypassPermissions" not in cmd
+    assert "Kit, remind me" in seen["kw"].get("input", "") and not any("Kit, remind me" in c for c in cmd)
+    assert seen["kw"]["cwd"] != str(asks.VAULT)  # the vault cwd drags the CLAUDE.md tree into every call
