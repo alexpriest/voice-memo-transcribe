@@ -1,6 +1,14 @@
 # voice-memo-transcribe
 
-Auto-transcribes new Apple Voice Memos into Alex's Obsidian daily notes.
+Transcribes every new Apple Voice Memo on-device and files it into the right Obsidian daily note.
+
+## Status
+
+Shipped — runs on a Mac Mini under launchd.
+
+## License
+
+Not licensed for reuse.
 
 A new memo lands → it's detected, transcribed on-device (mlx-whisper), lightly cleaned and
 wikilinked by Claude, and written into the correct daily note under a collapsible toggle with
