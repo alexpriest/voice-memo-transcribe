@@ -4,3 +4,4 @@ state/
 __pycache__/
 *.pyc
 bin/callguard
+.env
